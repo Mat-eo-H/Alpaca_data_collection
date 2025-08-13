@@ -1,0 +1,4 @@
+# Python dependencies - make sure the following packages are installed (using pip install)
+# example:  pip install alpaca-py pandas numpy - enter a command line like this in the terminal
+alpaca-py
+pandas
