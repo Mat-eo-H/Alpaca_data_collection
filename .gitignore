@@ -1,0 +1,30 @@
+# VS Code settings
+.vscode/
+
+# Python cache & compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+env/
+
+# Data files that shouldn't be shared
+data/*.csv
+data/*.xlsx
+*.db
+
+# Logs
+*.log
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Local configs (e.g., API keys, ports, account numbers)
+config_local.py
+data/GIT_Laverns_List.csv
+data/GIT_Trade_Log.csv
+# This is a local file and should not be shared
