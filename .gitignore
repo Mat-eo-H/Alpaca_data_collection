@@ -25,6 +25,5 @@ Thumbs.db
 
 # Local configs (e.g., API keys, ports, account numbers)
 config_local.py
-data/GIT_Laverns_List.csv
-data/GIT_Trade_Log.csv
+
 # This is a local file and should not be shared
