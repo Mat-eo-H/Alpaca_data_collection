@@ -29,25 +29,7 @@ def main():
     else:
         print("❌ No symbols retrieved")   
 
-    # handler = DataHandler("data")
-    # loaded_symbols = handler.load_csv("Lavernes_full_list.csv")
 
-    # if loaded_symbols is not None:
-    #     print(f"Loaded {len(loaded_symbols)} symbols from CSV")     
-    #     print(loaded_symbols.head())
-
-    # """Simple test to print missing symbols"""
-    # symbols_set = set(symbols_df['symbol'])
-    # loaded_set = set(loaded_symbols['symbol'])
-    
-    # missing_symbols = loaded_set - symbols_set
-    
-    # if missing_symbols:
-    #     print(f"⚠️  Found {len(missing_symbols)} symbols in loaded_symbols that are NOT in symbols_df:")
-    #     for symbol in sorted(missing_symbols):
-    #         print(f"   - {symbol}")
-    # else:
-    #     print("✅ All symbols in loaded_symbols are also present in symbols_df")
 
     download_all_symbols(trading_client=account, symbols_df=symbols_df)
 
