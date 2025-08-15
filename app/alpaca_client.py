@@ -145,6 +145,32 @@ def get_tradeable_symbols_df(
         print(f"❌ Error fetching symbols: {e}")
         return pd.DataFrame()
     
+def sanitize_data_dir(data_dir: str):
+    """
+    Keeps only symbol CSVs in data_dir.
+    All other files (including state CSVs, backups, etc.) are moved to a 'misc' folder.
+    """
+    misc_dir = os.path.join(os.path.dirname(data_dir), "misc")
+    os.makedirs(misc_dir, exist_ok=True)
+
+    for file in os.listdir(data_dir):
+        file_path = os.path.join(data_dir, file)
+
+        # Skip directories
+        if os.path.isdir(file_path):
+            continue
+
+        # Check if it's a CSV and looks like a stock symbol
+        if file.lower().endswith(".csv"):
+            symbol = os.path.splitext(file)[0]
+            if symbol.replace(".", "").isalnum():  # allow tickers like BRK.B
+                continue  # keep this one
+
+        # Everything else → move to misc
+        new_path = os.path.join(misc_dir, file)
+        print(f"[MOVE] {file} → {new_path}")
+        os.replace(file_path, new_path)
+    
 def fetch_1min_bars(symbol, start: datetime, end: datetime, limit=10000) -> pd.DataFrame:
     """
     Fetch all 1-minute bars for a symbol in the specified range using pagination.
@@ -216,15 +242,12 @@ def fetch_oldest_bar_date(symbol: str) -> pd.Timestamp:
 def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
     """
     Downloads 1-minute bars for all symbols in sync (most recent backwards),
-    maintains a state CSV, and **performs a one-time state migration** from local CSVs.
-    NOTE: this version keeps the hard exit after migration as requested.
     """
-
     # Ensure directories exist
     os.makedirs(BASE_DATA_DIR, exist_ok=True)
     DATA_DIR = os.path.join(BASE_DATA_DIR, "1mintrades")
     os.makedirs(DATA_DIR, exist_ok=True)
-    STATE_FILE = os.path.join(DATA_DIR, "download_state.csv")
+    STATE_FILE = os.path.join(BASE_DATA_DIR, "download_state.csv")
 
     # Load or init state
     if os.path.exists(STATE_FILE):
@@ -235,8 +258,11 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
                             .dt.tz_convert(NY_TZ)
 
         # If oldest_date is date-only or mixed tz, do the same; .normalize() -> midnight NY
-        state['oldest_date'] = pd.to_datetime(state['oldest_date'], errors='coerce', utc=True)\
-                                .dt.tz_convert(NY_TZ).dt.normalize()
+        if 'oldest_date' not in state.columns:
+            state['oldest_date'] = pd.Series(pd.NaT, dtype="datetime64[ns, America/New_York]")
+        else:
+            state['oldest_date'] = pd.to_datetime(state['oldest_date'], errors='coerce', utc=True).dt.tz_convert(NY_TZ)
+
 
         # 'complete' column fallback
         if 'complete' not in state.columns:
@@ -288,27 +314,47 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
     # 5) optional: sort & de-dup the index
     state = state[~state.index.duplicated(keep='first')].sort_index()
 
-    # 6) persist immediately (atomic write)
+    # 6) persist immediately (two writes; leave .tmp)
     tmp = STATE_FILE + ".tmp"
-    state.to_csv(tmp)
-    os.replace(tmp, STATE_FILE)
+
+    # write tmp with fsync
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        state.to_csv(f)
+        f.flush()
+        os.fsync(f.fileno())
+
+    # write final (no fsync)
+    state.to_csv(STATE_FILE)
         
 
     # Fill missing oldest_date via API, once
-    for symbol in symbols_df['symbol']:
+    oldestDateAPICallCounter = 0
+    for symbol in symbols:  # <-- use normalized list
+        if symbol not in state.index:
+            # belt & suspenders — should be covered by your align step
+            state.loc[symbol, ['last_end','oldest_date','complete']] = [pd.NaT, pd.NaT, False]
+
         if pd.isna(state.loc[symbol, 'oldest_date']):
             try:
                 api_oldest_ts = fetch_oldest_bar_date(symbol)
                 if pd.notna(api_oldest_ts):
                     state.loc[symbol, 'oldest_date'] = api_oldest_ts.tz_convert(NY_TZ).normalize()
-                    # print(f"[INFO] Oldest data for {symbol} starts {state.loc[symbol,'oldest_date']}")
+                print(f"[INFO] Oldest date for {symbol}: {state.loc[symbol, 'oldest_date']}")
+                oldestDateAPICallCounter += 1
+                if oldestDateAPICallCounter % 100 == 0:
+                    print(f"[INFO] Fetched oldest date for {oldestDateAPICallCounter} symbols so far, updating STATE_FILE")
+                    state.to_csv(STATE_FILE)
             except Exception as e:
                 print(f"[WARN] Failed to fetch oldest date for {symbol}: {e}")
+
+                
+
 
     # Save state atomically
     tmp = STATE_FILE + ".tmp"
     state.to_csv(tmp)
-    os.replace(tmp, STATE_FILE)
+    state.to_csv(STATE_FILE)
+
 
     symbols_remaining = set(state.index[state['complete'] == False])
     now = pd.Timestamp.now(tz=NY_TZ) - timedelta(days=1)  # one-day buffer
@@ -354,7 +400,7 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
                     # Save state atomically after each success
                     tmp = STATE_FILE + ".tmp"
                     state.to_csv(tmp)
-                    os.replace(tmp, STATE_FILE)
+                    state.to_csv(STATE_FILE)
                     break
 
                 except (RequestException, APIError, ConnectionError) as e:

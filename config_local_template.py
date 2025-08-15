@@ -1,7 +1,8 @@
 API_KEY = "GET_YOUR_API_KEY_AND_PASTE_HERE"
 API_SECRET = "GET_YOUR_API_SECRET_AND_PASTE_HERE"
 BASE_URL = "https://paper-api.alpaca.markets/v2"
-BASE_DATA_DIR = "c:/Users/matth/StockData"
+BASE_DATA_DIR = "c:/Users/YOUR_WINDOWS_USER/StockData"  # update to the file path where you want to save data.  Be aware "Documents" and "Desktop"
+                                                        # may be synced folders with OneDrive and cause issues
 MAX_RETRIES = 5
 RETRY_DELAY = 10  # seconds between retries
 CHUNK_DAYS = 90  # The number of days to get per symbol per loop, the code starts with most recent data, gets this number of days,
