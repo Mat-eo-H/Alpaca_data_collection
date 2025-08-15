@@ -3,15 +3,20 @@
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.trading.client import TradingClient
-from alpaca.data.timeframe import TimeFrame  # Add this import
+from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.requests import GetAssetsRequest
 from alpaca.trading.enums import AssetClass, AssetStatus
+from alpaca.common.exceptions import APIError
+from requests.exceptions import RequestException
 from datetime import datetime, timedelta
+import time
 import os
+import sys
 import pandas as pd
 import pytz
 from typing import Optional
-from config_local import API_KEY, API_SECRET, BASE_URL
+from config_local import API_KEY, API_SECRET, BASE_URL, BASE_DATA_DIR, MAX_RETRIES, RETRY_DELAY, CHUNK_DAYS, NY_TZ
+from app.utils import ensure_tz_aware
 from app.data_handler import save_bars_to_csv
 
 def connect_trading():
@@ -98,12 +103,12 @@ def get_tradeable_symbols_df(
         asset_data = []
         for asset in assets:
             # Apply additional filters if specified
-            # if tradable and not asset.tradable:
-            #     continue
-            # if shortable is not None and asset.shortable != shortable:
-            #     continue
-            # if fractionable is not None and asset.fractionable != fractionable:
-            #     continue
+            if tradable and not asset.tradable:
+                continue
+            if shortable is not None and asset.shortable != shortable:
+                continue
+            if fractionable is not None and asset.fractionable != fractionable:
+                continue
                 
             asset_dict = {
                 'symbol': asset.symbol,
@@ -142,15 +147,17 @@ def fetch_1min_bars(symbol, start: datetime, end: datetime, limit=10000) -> pd.D
 
     all_bars = []
     current_start = start
+    APIrequestDaysSize = 30  # max days per individual request (loops)
+
     while current_start < end:
-        current_end = min(current_start + timedelta(days=30), end)  # fetch max 30 days per request
+        current_end = min(current_start + timedelta(days=APIrequestDaysSize), end)  # fetch max 30 days per request
         try:
             request_params = StockBarsRequest(
                 symbol_or_symbols=symbol,
                 timeframe=TimeFrame.Minute,
                 start=current_start,
                 end=current_end,
-                adjustment="raw"
+                adjustment="split"  # adjust for splits
             )
             bars = data_client.get_stock_bars(request_params)
             df = bars.df.copy() if bars else pd.DataFrame()
@@ -167,56 +174,192 @@ def fetch_1min_bars(symbol, start: datetime, end: datetime, limit=10000) -> pd.D
         return full_df
     return pd.DataFrame()
 
-def download_all_symbols(trading_client: TradingClient,symbols_df):
+def fetch_oldest_bar_date(trading_client: TradingClient, symbol):
+    """Fetch oldest bar available for symbol from Alpaca."""
+    data_client = connect_data()
+
+    try:
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Day,
+            start=datetime(1900, 1, 1, tzinfo= pytz.timezone(NY_TZ)),
+            limit=1
+        )
+        bars = data_client.get_stock_bars(req)
+        if symbol in bars:
+            oldest_ts = bars[symbol][0].timestamp.astimezone(NY_TZ)
+            return oldest_ts.date()
+    except Exception as e:
+        print(f"[WARN] API error fetching oldest date for {symbol}: {e}")
+    return pd.NaT
+
+def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
     """
-    Downloads 1-minute bars for all symbols, starting with the last 90 days,
-    going further back, and keeps track of progress in a state CSV.
+    Downloads 1-minute bars for all symbols in sync (most recent backwards),
+    maintains a state CSV, and **performs a one-time state migration** from local CSVs.
+    NOTE: this version keeps the hard exit after migration as requested.
     """
-    
-    # Directories
-    BASE_DATA_DIR = "data"
+
+    # Ensure directories exist
+    os.makedirs(BASE_DATA_DIR, exist_ok=True)
     DATA_DIR = os.path.join(BASE_DATA_DIR, "1mintrades")
-    os.makedirs(DATA_DIR, exist_ok=True)    
+    os.makedirs(DATA_DIR, exist_ok=True)
     STATE_FILE = os.path.join(DATA_DIR, "download_state.csv")
 
-    # Load state file or initialize
+    # ----------------------------
+    # ONE-TIME MIGRATION (build new state file from existing symbol CSVs)
+    # ----------------------------
+    ran_migration = False
     if os.path.exists(STATE_FILE):
-        state = pd.read_csv(STATE_FILE, index_col='symbol')
-    else:
-        state = pd.DataFrame({'last_end': pd.NaT}, index=symbols_df['symbol'])
+        backup_file = STATE_FILE + ".bak"
+        os.replace(STATE_FILE, backup_file)
+        print(f"[BACKUP] Old state file backed up as {backup_file}")
+        ran_migration = True
 
-    chunk_days = 90
-    current_end = datetime.now() - timedelta(days=1)
+    state_rows = []
 
-    symbols_remaining = set(symbols_df['symbol'])
+    for file in os.listdir(DATA_DIR):
+        if not file.lower().endswith(".csv") or file == "download_state.csv":
+            continue
 
-    while symbols_remaining:
-        current_start = current_end - timedelta(days=chunk_days)
-        symbols_to_remove = set()
+        symbol = os.path.splitext(file)[0]
+        csv_path = os.path.join(DATA_DIR, file)
 
-        for symbol in symbols_remaining:
-            last_end = state.loc[symbol, 'last_end']
-            if pd.notna(last_end):
-                last_end_dt = datetime.fromisoformat(last_end)
-                if current_start <= last_end_dt:
-                    continue  # already downloaded
-
-            print(f"Fetching {symbol} from {current_start.date()} to {current_end.date()}...")
-            bars_df = fetch_1min_bars(trading_client, symbol, start=current_start, end=current_end)
-
-            if bars_df.empty:
-                print(f"No more data for {symbol}, removing from active list.")
-                symbols_to_remove.add(symbol)
+        try:
+            df = pd.read_csv(csv_path)
+            if df.empty or 'date' not in df.columns or 'time' not in df.columns:
+                print(f"[SKIP] No usable data in {symbol}.csv")
                 continue
 
-            save_bars_to_csv(bars_df, symbol, DATA_DIR)
-            state.loc[symbol, 'last_end'] = current_start.isoformat()
+            # Combine date/time; your CSVs hold NY local time strings → localize to NY
+            dt = pd.to_datetime(df['date'] + ' ' + df['time'], errors='coerce')
+            dt = dt.dt.tz_localize(NY_TZ, nonexistent='NaT', ambiguous='NaT')
+            last_end = dt.max()          # latest timestamp present (tz-aware NY)
+            local_oldest = dt.min()      # earliest timestamp present (tz-aware NY)
 
-        # Save progress
-        state.to_csv(STATE_FILE)
+            # API check for *true* oldest available date
+            api_oldest_ts = fetch_oldest_bar_date(symbol)
+            if pd.notna(api_oldest_ts):
+                oldest_dt = api_oldest_ts.tz_convert(NY_TZ).normalize()  # midnight NY of that day
+            else:
+                oldest_dt = pd.Timestamp(local_oldest.date()).tz_localize(NY_TZ)
 
-        # Remove symbols with no more data
-        symbols_remaining -= symbols_to_remove
+            state_rows.append({
+                'symbol': symbol,
+                'last_end': last_end,   # tz-aware NY
+                'oldest_date': oldest_dt,  # tz-aware NY midnight
+                'complete': False
+            })
 
-        # Move window back
-        current_end = current_start
+            print(f"[OK] {symbol}: last_end={last_end}, oldest_date={oldest_dt}")
+
+        except Exception as e:
+            print(f"[ERROR] Failed processing {symbol}: {e}")
+
+    state_df = pd.DataFrame(state_rows).set_index('symbol')
+
+    # Atomic write
+    tmp = STATE_FILE + ".tmp"
+    state_df.to_csv(tmp)
+    os.replace(tmp, STATE_FILE)
+    print(f"[DONE] New state file saved: {STATE_FILE}")
+
+    # ----------------------------
+    # KEEP HARD EXIT (as requested)
+    # ----------------------------
+    sys.exit(0)
+
+    # ----------------------------
+    # Downloader (won't run until you remove the exit above)
+    # ----------------------------
+
+    # Load or init state
+    if os.path.exists(STATE_FILE):
+        state = pd.read_csv(STATE_FILE, index_col='symbol', parse_dates=['last_end', 'oldest_date'])
+        # Normalize tz (if parse lost tz info)
+        try:
+            state['last_end'] = ensure_tz_aware(state['last_end'])
+            state['oldest_date'] = ensure_tz_aware(state['oldest_date'])
+        except Exception:
+            pass
+        if 'complete' not in state.columns:
+            state['complete'] = False
+    else:
+        # fresh state
+        state = pd.DataFrame(index=symbols_df['symbol'].tolist())
+        state['last_end'] = pd.NaT
+        state['oldest_date'] = pd.NaT
+        state['complete'] = False
+
+    # Fill missing oldest_date via API, once
+    for symbol in symbols_df['symbol']:
+        if pd.isna(state.loc[symbol, 'oldest_date']):
+            try:
+                api_oldest_ts = fetch_oldest_bar_date(symbol)
+                if pd.notna(api_oldest_ts):
+                    state.loc[symbol, 'oldest_date'] = api_oldest_ts.tz_convert(NY_TZ).normalize()
+                    print(f"[INFO] Oldest data for {symbol} starts {state.loc[symbol,'oldest_date']}")
+            except Exception as e:
+                print(f"[WARN] Failed to fetch oldest date for {symbol}: {e}")
+
+    # Save state atomically
+    tmp = STATE_FILE + ".tmp"
+    state.to_csv(tmp)
+    os.replace(tmp, STATE_FILE)
+
+    symbols_remaining = set(state.index[state['complete'] == False])
+    now = pd.Timestamp.now(tz=NY_TZ) - timedelta(days=1)  # one-day buffer
+
+    while symbols_remaining:
+        for symbol in list(symbols_remaining):
+            oldest_date = state.loc[symbol, 'oldest_date']
+            last_end = state.loc[symbol, 'last_end']
+
+            # Determine end_date boundary (move backward)
+            end_date = now if pd.isna(last_end) else last_end
+
+            # Determine start_date = max(oldest_date, end_date - CHUNK_DAYS)
+            start_date = end_date - timedelta(days=CHUNK_DAYS)
+            if pd.notna(oldest_date) and start_date < oldest_date:
+                start_date = oldest_date
+
+            # Already complete?
+            if pd.notna(oldest_date) and start_date >= end_date:
+                print(f"[DONE] {symbol} — all data fetched.")
+                state.loc[symbol, 'complete'] = True
+                symbols_remaining.remove(symbol)
+                continue
+
+            retries = 0
+            while retries < MAX_RETRIES:
+                try:
+                    print(f"[FETCH] {symbol} from {start_date} to {end_date}")
+                    # IMPORTANT: Correct call signature (no trading_client as first arg)
+                    bars_df = fetch_1min_bars(symbol, start=start_date, end=end_date)
+
+                    if bars_df.empty:
+                        print(f"[INFO] No more bars for {symbol}; marking complete.")
+                        state.loc[symbol, 'complete'] = True
+                        symbols_remaining.remove(symbol)
+                        break
+
+                    save_bars_to_csv(bars_df, symbol, DATA_DIR)
+
+                    # Move boundary older by one chunk: next loop will fetch further back
+                    state.loc[symbol, 'last_end'] = start_date
+
+                    # Save state atomically after each success
+                    tmp = STATE_FILE + ".tmp"
+                    state.to_csv(tmp)
+                    os.replace(tmp, STATE_FILE)
+                    break
+
+                except (RequestException, APIError, ConnectionError) as e:
+                    retries += 1
+                    wait_time = RETRY_DELAY * retries
+                    print(f"[ERROR] {symbol}: {e} — retry {retries}/{MAX_RETRIES} in {wait_time}s...")
+                    time.sleep(wait_time)
+
+            else:
+                print(f"[FATAL] Skipping {symbol} after {MAX_RETRIES} retries.")
+                symbols_remaining.remove(symbol)
