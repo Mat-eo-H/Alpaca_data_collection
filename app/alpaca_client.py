@@ -199,7 +199,7 @@ def fetch_1min_bars(symbol, start: datetime, end: datetime, limit=10000) -> pd.D
             current_start = current_end  # move to next chunk
         except Exception as e:
             print(f"Error fetching {symbol} from {current_start} to {current_end}: {e}")
-            break  # stop on error to retry later
+            raise  # stop on error to retry later
     if all_bars:
         full_df = pd.concat(all_bars).sort_index()
         # Remove duplicates if any
@@ -387,10 +387,18 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
                     bars_df = fetch_1min_bars(symbol, start=start_date, end=end_date)
 
                     if bars_df.empty:
-                        print(f"[INFO] No more bars for {symbol}; marking complete.")
-                        state.loc[symbol, 'complete'] = True
-                        symbols_remaining.remove(symbol)
-                        break
+                           # Only mark complete when we've reached or crossed the oldest boundary
+                            if pd.notna(oldest_date) and (start_date <= oldest_date):
+                                print(f"[INFO] No more bars for {symbol}; marking complete.")
+                                state.loc[symbol, 'complete'] = True
+                                symbols_remaining.remove(symbol)
+                            else:
+                                print(f"[INFO] No bars returned for {symbol} in this chunk; keeping symbol active (likely data gap or temp issue).")
+                            # Do NOT advance last_end on an empty result
+                            tmp = STATE_FILE + ".tmp"
+                            state.to_csv(tmp)
+                            state.to_csv(STATE_FILE)
+                            break
 
                     save_bars_to_csv(bars_df, symbol, DATA_DIR)
 
