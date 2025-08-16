@@ -15,4 +15,4 @@ BULLET POINTS FOR NEW USERS
 11. This code gets all available symbols from Alpaca US Equities and filteres them to exclude non-tradable, non-shortable and inactive (you can modify the code if you want something different)
 12. After sorting between 11,000 and 12,000 symbol names are returned by the API as of the date of this ReadMe, that is a LOT of 1 minute data.
 13. I recommend setting the BASE_DATA_DIR in your config_local file to a NON_SYNCED (ex. not part of OneDrive, or a similar syncing system) folder on your hard drive, or you may wipe out your synced space.
-14. The first 90 days of all sysmbols will comsume 8-10 GB of harddrive space.  If you want extended history, it will take a very large amount of hard drive space.
+14. The first 90 days of all sysmbols will comsume more than 20 GB of harddrive space.  If you want extended history, it will take a very large amount of hard drive space.
