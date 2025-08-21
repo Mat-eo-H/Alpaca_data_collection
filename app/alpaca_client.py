@@ -32,6 +32,156 @@ from app.data_handler import save_bars_to_csv
 
 
 _data_connected_once = False
+_aapl_days_loaded = False
+_aapl_days: set = set()
+_aapl_earliest_day: Optional[pd.Timestamp] = None
+_aapl_latest_day: Optional[pd.Timestamp] = None
+
+def _get_aapl_trading_days(start: datetime, end: datetime) -> set:
+    """Return set of NY date objects where AAPL traded between start/end using local AAPL.csv.
+    Only fetch from API when: (a) AAPL.csv missing, or (b) we require dates earlier than current earliest coverage.
+    We do NOT fetch forward/newer because main process walks backward.
+    """
+    global _aapl_days_loaded, _aapl_days, _aapl_earliest_day, _aapl_latest_day
+    try:
+        data_dir = os.path.join(BASE_DATA_DIR, "1mintrades")
+        os.makedirs(data_dir, exist_ok=True)
+        aapl_path = os.path.join(data_dir, 'AAPL.csv')
+        # Initial load from CSV if exists and not loaded
+        if not _aapl_days_loaded and os.path.exists(aapl_path):
+            try:
+                df_existing = pd.read_csv(aapl_path)
+                # attempt timestamp reconstruction from date + time
+                if 'date' in df_existing.columns and 'time' in df_existing.columns:
+                    ts = pd.to_datetime(df_existing['date'].astype(str) + ' ' + df_existing['time'].astype(str), errors='coerce')
+                else:
+                    # fallback: any plausible timestamp column
+                    ts_col = None
+                    for c in ['timestamp','time','t','datetime','date']:
+                        if c in df_existing.columns:
+                            ts_col = c; break
+                    if ts_col is None:
+                        ts = pd.Series([], dtype='datetime64[ns]')
+                    else:
+                        ts = pd.to_datetime(df_existing[ts_col], errors='coerce')
+                ts = ts.dropna().dt.tz_localize(NY_TZ, nonexistent='NaT', ambiguous='NaT') if ts.dt.tz is None else ts.dt.tz_convert(NY_TZ)
+                if not ts.empty:
+                    _aapl_days = set(ts.dt.date)
+                    _aapl_earliest_day = pd.Timestamp(min(_aapl_days), tz=NY_TZ)
+                    _aapl_latest_day = pd.Timestamp(max(_aapl_days), tz=NY_TZ)
+                _aapl_days_loaded = True
+            except Exception as ee:
+                print(colorama.Fore.RED + f"[AAPL] Error loading existing AAPL.csv: {ee}" + colorama.Style.RESET_ALL)
+                _aapl_days_loaded = True  # prevent repeated attempts
+
+        # If no data loaded, fetch current requested window once
+        if not _aapl_days:
+            feed_enum = StockDataFeed.SIP if StockDataFeed is not None else None
+            df_new, _ = fetch_1min_bars('AAPL', start=start, end=end, feed=feed_enum)
+            if df_new is not None and not df_new.empty:
+                # Save for reuse
+                save_bars_to_csv(df_new, 'AAPL', data_dir)
+                # Derive days
+                if isinstance(df_new.index, pd.MultiIndex):
+                    ts_idx = df_new.index.get_level_values('timestamp') if 'timestamp' in df_new.index.names else df_new.index.get_level_values(-1)
+                else:
+                    ts_idx = df_new.index
+                ts_idx = pd.DatetimeIndex(ts_idx).tz_convert(NY_TZ)
+                _aapl_days = set(ts_idx.date)
+                _aapl_earliest_day = pd.Timestamp(min(_aapl_days), tz=NY_TZ)
+                _aapl_latest_day = pd.Timestamp(max(_aapl_days), tz=NY_TZ)
+                print(colorama.Fore.CYAN + f"[AAPL] Initialized trading day mask covering {_aapl_earliest_day.date()} -> {_aapl_latest_day.date()} ({len(_aapl_days)} days)." + colorama.Style.RESET_ALL)
+            return {d for d in _aapl_days if start.date() <= d <= end.date()}
+
+        # If we need earlier days than we have, backfill ONLY the missing earlier segment
+        if _aapl_earliest_day is None or _aapl_latest_day is None:
+            return {d for d in _aapl_days if start.date() <= d <= end.date()}
+
+        if start.date() < _aapl_earliest_day.date():
+            # Fetch from new start to one day before current earliest
+            backfill_end = _aapl_earliest_day - pd.Timedelta(seconds=1)
+            feed_enum = StockDataFeed.SIP if StockDataFeed is not None else None
+            try:
+                df_old, _ = fetch_1min_bars('AAPL', start=start, end=backfill_end, feed=feed_enum)
+                if df_old is not None and not df_old.empty:
+                    save_bars_to_csv(df_old, 'AAPL', data_dir)
+                    if isinstance(df_old.index, pd.MultiIndex):
+                        old_ts_idx = df_old.index.get_level_values('timestamp') if 'timestamp' in df_old.index.names else df_old.index.get_level_values(-1)
+                    else:
+                        old_ts_idx = df_old.index
+                    old_ts_idx = pd.DatetimeIndex(old_ts_idx).tz_convert(NY_TZ)
+                    new_days = set(old_ts_idx.date)
+                    _aapl_days.update(new_days)
+                    _aapl_earliest_day = pd.Timestamp(min(_aapl_days), tz=NY_TZ)
+                    print(colorama.Fore.CYAN + f"[AAPL] Backfilled earlier AAPL days now covering {_aapl_earliest_day.date()} -> {_aapl_latest_day.date()} ({len(_aapl_days)} days)." + colorama.Style.RESET_ALL)
+            except Exception as be:
+                print(colorama.Fore.RED + f"[AAPL] Backfill error: {be}" + colorama.Style.RESET_ALL)
+
+        # Return days subset for window
+        return {d for d in _aapl_days if start.date() <= d <= end.date()}
+    except Exception as e:
+        print(colorama.Fore.RED + f"[AAPL] Unexpected trading day mask error: {e}" + colorama.Style.RESET_ALL)
+        return set()
+
+def _fill_edge_days(symbol: str, bars_df: pd.DataFrame, start: datetime, end: datetime, trading_days: set, feed, max_edge_days: int = 10) -> pd.DataFrame:
+    """Attempt to fetch missing edge trading days (earliest or latest) inside the 30-day chunk window.
+    We only look at full missing days vs AAPL mask. If illiquid (no bars returned on single-day fetch) we accept and move on.
+    Limits to max_edge_days each side to bound API usage.
+    """
+    if bars_df is None or bars_df.empty or not trading_days:
+        return bars_df
+    # Normalize index to timestamps
+    if isinstance(bars_df.index, pd.MultiIndex):
+        sym_ts = bars_df.index.get_level_values('timestamp') if 'timestamp' in bars_df.index.names else bars_df.index.get_level_values(-1)
+    else:
+        sym_ts = bars_df.index
+    sym_ts = pd.DatetimeIndex(sym_ts).tz_convert(NY_TZ)
+    symbol_days = set(sym_ts.date)
+    if not symbol_days:
+        return bars_df
+    first_trade_day = min(trading_days)
+    last_trade_day = max(trading_days)
+    sym_first = min(symbol_days)
+    sym_last = max(symbol_days)
+
+    feed_enum = feed
+    # Fill missing earlier edge days
+    if sym_first > first_trade_day:
+        earlier_days = sorted([d for d in trading_days if first_trade_day <= d < sym_first])[:max_edge_days]
+        for d in earlier_days:
+            day_start = pd.Timestamp(d, tz=NY_TZ)
+            day_end = day_start + pd.Timedelta(days=1)
+            add_df, _ = fetch_1min_bars(symbol, start=day_start, end=day_end, feed=feed_enum)
+            if add_df is not None and not add_df.empty:
+                if isinstance(add_df.index, pd.MultiIndex):
+                    add_ts = add_df.index.get_level_values('timestamp') if 'timestamp' in add_df.index.names else add_df.index.get_level_values(-1)
+                else:
+                    add_ts = add_df.index
+                bars_df = pd.concat([bars_df, add_df]).sort_index()
+                bars_df = bars_df[~bars_df.index.duplicated(keep='first')]
+                print(colorama.Fore.GREEN + f"[EDGE] Filled earlier day {d} for {symbol}" + colorama.Style.RESET_ALL)
+            else:
+                print(colorama.Fore.YELLOW + f"[EDGE] No trades for {symbol} on {d}; accepting as illiquid day." + colorama.Style.RESET_ALL)
+
+    # Fill missing later edge days
+    if sym_last < last_trade_day:
+        later_days_all = sorted([d for d in trading_days if sym_last < d <= last_trade_day])
+        later_days = later_days_all[:max_edge_days]
+        for d in later_days:
+            day_start = pd.Timestamp(d, tz=NY_TZ)
+            day_end = day_start + pd.Timedelta(days=1)
+            add_df, _ = fetch_1min_bars(symbol, start=day_start, end=day_end, feed=feed_enum)
+            if add_df is not None and not add_df.empty:
+                if isinstance(add_df.index, pd.MultiIndex):
+                    add_ts = add_df.index.get_level_values('timestamp') if 'timestamp' in add_df.index.names else add_df.index.get_level_values(-1)
+                else:
+                    add_ts = add_df.index
+                bars_df = pd.concat([bars_df, add_df]).sort_index()
+                bars_df = bars_df[~bars_df.index.duplicated(keep='first')]
+                print(colorama.Fore.GREEN + f"[EDGE] Filled later day {d} for {symbol}" + colorama.Style.RESET_ALL)
+            else:
+                print(colorama.Fore.YELLOW + f"[EDGE] No trades for {symbol} on {d}; accepting as illiquid day." + colorama.Style.RESET_ALL)
+    return bars_df
 
 def connect_trading():
     """Connect to Alpaca trading API."""
@@ -269,9 +419,12 @@ def fetch_1min_bars(symbol, start: datetime, end: datetime, feed=None, limit=100
                 coverage_gap = (earliest > (start + timedelta(minutes=2))) or (latest < (end - timedelta(minutes=2)))
         except Exception:
             coverage_gap = False
+
+        # Simplified truncation: only consider edge coverage or pagination heuristic
         truncated = bool(saw_full_page_without_token or coverage_gap)
         meta = {"truncated": truncated, "earliest": earliest, "latest": latest, "pages": pages, "count": int(total_rows)}
         return full_df, meta
+    # No bars accumulated
     return pd.DataFrame(), {"truncated": False, "earliest": pd.NaT, "latest": pd.NaT, "pages": 0, "count": 0}
 
 def _get_symbol_data_span_days(data_dir: str, symbol: str) -> float:
@@ -359,12 +512,18 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
         # 'complete' column fallback
         if 'complete' not in state.columns:
             state['complete'] = False
+        # newest_date column fallback
+        if 'newest_date' not in state.columns:
+            state['newest_date'] = pd.NaT
+        else:
+            state['newest_date'] = pd.to_datetime(state['newest_date'], errors='coerce', utc=True).dt.tz_convert(NY_TZ).dt.normalize()
     else:
         # fresh state
         state = pd.DataFrame(index=symbols_df['symbol'].tolist())
         state['last_end'] = pd.NaT
         state['oldest_date'] = pd.NaT
-        state['complete'] = False
+    state['complete'] = False
+    state['newest_date'] = pd.NaT
 
     # --- normalize and align state with symbols_df ---
 
@@ -389,7 +548,7 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
         )
 
     # 3) ensure required columns exist
-    for col, default in [('last_end', pd.NaT), ('oldest_date', pd.NaT), ('complete', False), ('feed', '')]:
+    for col, default in [('last_end', pd.NaT), ('oldest_date', pd.NaT), ('complete', False), ('feed', ''), ('newest_date', pd.NaT)]:
         if col not in state.columns:
             state[col] = default
 
@@ -400,7 +559,8 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
             'last_end': pd.NaT,
             'oldest_date': pd.NaT,
             'complete': False,
-            'feed': ''
+            'feed': '',
+            'newest_date': pd.NaT
         }, index=pd.Index(missing, name='symbol'))
         state = pd.concat([state, new_rows], axis=0)
 
@@ -428,7 +588,7 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
     for symbol in symbols:  # normalized list
         # Ensure row exists
         if symbol not in state.index:
-            state.loc[symbol, ['last_end', 'oldest_date', 'complete', 'feed']] = [pd.NaT, pd.NaT, False, '']
+            state.loc[symbol, ['last_end', 'oldest_date', 'complete', 'feed', 'newest_date']] = [pd.NaT, pd.NaT, False, '', pd.NaT]
 
         # Determine if symbol is "new" to the database: no CSV in DATA_DIR
         sym_csv = os.path.join(DATA_DIR, f"{symbol}.csv")
@@ -507,6 +667,32 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
             if pd.notna(oldest_date) and start_date >= end_date:
                 print(f"[DONE] {symbol} — all data fetched.")
                 state.loc[symbol, 'complete'] = True
+                # forward fill to yesterday if possible
+                try:
+                    yesterday_ny = (pd.Timestamp.now(tz=NY_TZ) - pd.Timedelta(days=1)).normalize()
+                    newest_date = state.loc[symbol, 'newest_date'] if 'newest_date' in state.columns else pd.NaT
+                    if pd.notna(newest_date) and newest_date < yesterday_ny:
+                        ff_start = newest_date + pd.Timedelta(days=1)
+                        ff_end = yesterday_ny + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                        feed_enum = None
+                        if StockDataFeed is not None:
+                            if feed_str.upper() == 'IEX':
+                                feed_enum = StockDataFeed.IEX
+                            elif feed_str.upper() == 'SIP':
+                                feed_enum = StockDataFeed.SIP
+                        print(colorama.Fore.BLUE + f"[FWD] {symbol} forward fill {ff_start.date()} -> {yesterday_ny.date()}" + colorama.Style.RESET_ALL)
+                        ff_df, ff_meta = fetch_1min_bars(symbol, start=ff_start, end=ff_end, feed=feed_enum)
+                        if ff_df is not None and not ff_df.empty:
+                            save_bars_to_csv(ff_df, symbol, DATA_DIR)
+                            if isinstance(ff_df.index, pd.MultiIndex):
+                                ff_ts = ff_df.index.get_level_values('timestamp') if 'timestamp' in ff_df.index.names else ff_df.index.get_level_values(-1)
+                            else:
+                                ff_ts = ff_df.index
+                            ff_ts = pd.DatetimeIndex(ff_ts).tz_convert(NY_TZ)
+                            state.loc[symbol, 'newest_date'] = ff_ts.max().normalize()
+                            print(colorama.Fore.GREEN + f"[FWD] {symbol} up-to-date through {state.loc[symbol, 'newest_date'].date()}" + colorama.Style.RESET_ALL)
+                except Exception as e_ff_sym:
+                    print(colorama.Fore.RED + f"[FWD] {symbol} forward fill error: {e_ff_sym}" + colorama.Style.RESET_ALL)
                 symbols_remaining.remove(symbol)
                 continue
 
@@ -519,10 +705,38 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
                     bars_df, meta = fetch_1min_bars(symbol, start=start_date, end=end_date, feed=primary_feed)
 
                     if bars_df.empty:
+                        # Summarize fetch result even when empty
+                        print(f"[FETCH] {symbol} received 0 bars; oldest=N/A; days=0.00")
                         # Do not advance dates on empty; only mark complete if we're at or past the oldest boundary
                         if pd.notna(oldest_date) and (start_date <= oldest_date):
                             print(colorama.Fore.LIGHTCYAN_EX, f"[INFO] No more bars for {symbol}; marking complete.", colorama.Style.RESET_ALL)
                             state.loc[symbol, 'complete'] = True
+                            # forward fill attempt
+                            try:
+                                yesterday_ny = (pd.Timestamp.now(tz=NY_TZ) - pd.Timedelta(days=1)).normalize()
+                                newest_date = state.loc[symbol, 'newest_date'] if 'newest_date' in state.columns else pd.NaT
+                                if pd.notna(newest_date) and newest_date < yesterday_ny:
+                                    ff_start = newest_date + pd.Timedelta(days=1)
+                                    ff_end = yesterday_ny + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                                    feed_enum = None
+                                    if StockDataFeed is not None:
+                                        if feed_str.upper() == 'IEX':
+                                            feed_enum = StockDataFeed.IEX
+                                        elif feed_str.upper() == 'SIP':
+                                            feed_enum = StockDataFeed.SIP
+                                    print(colorama.Fore.BLUE + f"[FWD] {symbol} forward fill {ff_start.date()} -> {yesterday_ny.date()}" + colorama.Style.RESET_ALL)
+                                    ff_df, ff_meta = fetch_1min_bars(symbol, start=ff_start, end=ff_end, feed=feed_enum)
+                                    if ff_df is not None and not ff_df.empty:
+                                        save_bars_to_csv(ff_df, symbol, DATA_DIR)
+                                        if isinstance(ff_df.index, pd.MultiIndex):
+                                            ff_ts = ff_df.index.get_level_values('timestamp') if 'timestamp' in ff_df.index.names else ff_df.index.get_level_values(-1)
+                                        else:
+                                            ff_ts = ff_df.index
+                                        ff_ts = pd.DatetimeIndex(ff_ts).tz_convert(NY_TZ)
+                                        state.loc[symbol, 'newest_date'] = ff_ts.max().normalize()
+                                        print(colorama.Fore.GREEN + f"[FWD] {symbol} up-to-date through {state.loc[symbol, 'newest_date'].date()}" + colorama.Style.RESET_ALL)
+                            except Exception as e_ff2:
+                                print(colorama.Fore.RED + f"[FWD] {symbol} forward fill error: {e_ff2}" + colorama.Style.RESET_ALL)
                             symbols_remaining.remove(symbol)
                         # Persist state and continue
                         tmp = STATE_FILE + ".tmp"
@@ -530,15 +744,116 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
                         state.to_csv(STATE_FILE)
                         break
 
+                    # Summarize fetch result when we have data
+                    try:
+                        count = int(meta.get('count', len(bars_df)))
+                        earliest = meta.get('earliest')
+                        latest = meta.get('latest')
+                        if pd.notna(earliest) and pd.notna(latest):
+                            days_covered = max(0.0, (latest - earliest).total_seconds() / 86400.0)
+                        else:
+                            # Fallback compute from DataFrame if meta missing
+                            if isinstance(bars_df.index, pd.MultiIndex):
+                                ts_idx = bars_df.index.get_level_values('timestamp') if 'timestamp' in bars_df.index.names else bars_df.index.get_level_values(-1)
+                            else:
+                                ts_idx = bars_df.index
+                            earliest = pd.to_datetime(ts_idx.min()).tz_convert(NY_TZ)
+                            latest = pd.to_datetime(ts_idx.max()).tz_convert(NY_TZ)
+                            days_covered = max(0.0, (latest - earliest).total_seconds() / 86400.0)
+                        print(f"[FETCH] {symbol} received {count} bars; oldest={earliest}; days={days_covered:.2f}")
+                    except Exception:
+                        print(f"[FETCH] {symbol} received {len(bars_df)} bars; oldest=unknown; days=unknown")
+
                     save_bars_to_csv(bars_df, symbol, DATA_DIR)
 
-                    # If truncated/incomplete coverage, warn loudly and use the earliest timestamp actually saved
-                    if meta.get('truncated', False):
-                        print(colorama.Fore.MAGENTA + f"[WARN] Bars possibly truncated for {symbol} ({meta.get('count')} rows across {meta.get('pages')} page(s))." + colorama.Style.RESET_ALL)
-                        print(colorama.Fore.CYAN + f"[WARN] Coverage from {meta.get('earliest')} to {meta.get('latest')} may not span the requested window {start_date} to {end_date}." + colorama.Style.RESET_ALL)
+                    # Edge-only missing detection using AAPL mask
+                    if meta.get('earliest') is not None and pd.notna(meta.get('earliest')) and meta.get('latest') is not None and pd.notna(meta.get('latest')):
+                        try:
+                            aapl_days = _get_aapl_trading_days(start_date, end_date)
+                        except Exception:
+                            aapl_days = set()
+                        # Determine symbol day coverage
+                        if isinstance(bars_df.index, pd.MultiIndex):
+                            ts_idx_all = bars_df.index.get_level_values('timestamp') if 'timestamp' in bars_df.index.names else bars_df.index.get_level_values(-1)
+                        else:
+                            ts_idx_all = bars_df.index
+                        ts_idx_all = pd.DatetimeIndex(ts_idx_all).tz_convert(NY_TZ)
+                        symbol_days = set(ts_idx_all.normalize().date)
+                        if symbol_days:
+                            first_sym_day = min(symbol_days)
+                            last_sym_day = max(symbol_days)
+                            older_missing_days = sorted([d for d in aapl_days if d < first_sym_day])
+                            newer_missing_days = sorted([d for d in aapl_days if d > last_sym_day])
+                        else:
+                            older_missing_days = sorted(list(aapl_days))
+                            newer_missing_days = []
+                        # Earlier edge fill (older_missing_days)
+                        if older_missing_days:
+                            # Adjust oldest_date boundary forward; we won't chase beyond first AAPL day seen missing
+                            first_available = pd.Timestamp(first_sym_day, tz=NY_TZ)
+                            state.loc[symbol, 'oldest_date'] = max(state.loc[symbol, 'oldest_date'], first_available) if pd.notna(state.loc[symbol, 'oldest_date']) else first_available
+                            print(colorama.Fore.LIGHTBLUE_EX + f"[EDGE-OLD] Missing {len(older_missing_days)} earlier AAPL trading day(s) for {symbol} before {first_sym_day}; boundary set to {state.loc[symbol, 'oldest_date'].date()}." + colorama.Style.RESET_ALL)
+                        # Newer edge forward fill attempts only for full missing trading days
+                        if newer_missing_days:
+                            slack = timedelta(minutes=2)
+                            attempts = 0
+                            latest_cov = meta.get('latest')
+                            # Fetch each missing day individually until up-to-date with end_date AAPL days
+                            for d in newer_missing_days:
+                                # Don't go beyond requested end chunk
+                                day_start = pd.Timestamp(d, tz=NY_TZ)
+                                if day_start > end_date:
+                                    break
+                                day_end = day_start + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                                print(colorama.Fore.YELLOW + f"[EDGE-NEW] Filling missing trading day {d} for {symbol}" + colorama.Style.RESET_ALL)
+                                add_df, add_meta = fetch_1min_bars(symbol, start=day_start, end=day_end, feed=primary_feed)
+                                if add_df is not None and not add_df.empty:
+                                    if isinstance(add_df.index, pd.MultiIndex):
+                                        add_idx = add_df.index.get_level_values('timestamp') if 'timestamp' in add_df.index.names else add_df.index.get_level_values(-1)
+                                    else:
+                                        add_idx = add_df.index
+                                    bars_df = pd.concat([bars_df, add_df]).sort_index()
+                                    bars_df = bars_df[~bars_df.index.duplicated(keep='first')]
+                                    latest_cov = add_meta.get('latest', latest_cov)
+                                    print(colorama.Fore.GREEN + f"[EDGE-NEW] Added {len(add_df)} bars for {symbol} on {d}" + colorama.Style.RESET_ALL)
+                                else:
+                                    print(colorama.Fore.YELLOW + f"[EDGE-NEW] No trades for {symbol} on {d}; treating as illiquid." + colorama.Style.RESET_ALL)
+                                attempts += 1
+                            # Recompute earliest/latest after edge fills
+                            if isinstance(bars_df.index, pd.MultiIndex):
+                                ts_idx_all = bars_df.index.get_level_values('timestamp') if 'timestamp' in bars_df.index.names else bars_df.index.get_level_values(-1)
+                            else:
+                                ts_idx_all = bars_df.index
+                            meta['earliest'] = pd.to_datetime(ts_idx_all.min()).tz_convert(NY_TZ)
+                            meta['latest'] = pd.to_datetime(ts_idx_all.max()).tz_convert(NY_TZ)
+                        # Only warn if there remain AAPL trading days beyond latest after attempts
+                        if 'newer_missing_days' in locals() and newer_missing_days:
+                            last_aapl_day = max(aapl_days) if aapl_days else None
+                            if last_aapl_day and last_aapl_day > max(symbol_days):
+                                missing_remaining = len([d for d in newer_missing_days if d > max(symbol_days)])
+                                if missing_remaining:
+                                    print(colorama.Fore.MAGENTA + f"[WARN] {symbol} still missing {missing_remaining} recent AAPL trading day(s) up to {last_aapl_day}." + colorama.Style.RESET_ALL)
+                        # Update state newest_date after fills
+                        latest_for_newest = meta.get('latest')
+                        if latest_for_newest is not None and pd.notna(latest_for_newest):
+                            try:
+                                nd = latest_for_newest.tz_convert(NY_TZ).normalize()
+                                if pd.isna(state.loc[symbol, 'newest_date']) or nd > state.loc[symbol, 'newest_date']:
+                                    state.loc[symbol, 'newest_date'] = nd
+                            except Exception:
+                                pass
                     # Move boundary older using the earliest actual bar saved (prevents gaps when coverage is sparse)
                     earliest_ts = meta.get('earliest', None)
                     state.loc[symbol, 'last_end'] = earliest_ts if pd.notna(earliest_ts) else start_date
+                    # update newest_date from meta.latest
+                    latest_for_newest = meta.get('latest')
+                    if latest_for_newest is not None and pd.notna(latest_for_newest):
+                        try:
+                            nd = latest_for_newest.tz_convert(NY_TZ).normalize()
+                            if pd.isna(state.loc[symbol, 'newest_date']) or nd > state.loc[symbol, 'newest_date']:
+                                state.loc[symbol, 'newest_date'] = nd
+                        except Exception:
+                            pass
 
                     # Save state atomically after each success
                     tmp = STATE_FILE + ".tmp"
@@ -606,3 +921,88 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
             else:
                 print(f"[FATAL] Skipping {symbol} after {MAX_RETRIES} retries.")
                 symbols_remaining.remove(symbol)
+
+def repair_symbol_gaps(symbol: str, data_dir: str, feed: str = '', max_days_window: int = 30):
+    """Scan a symbol's CSV for missing 1-minute bars and attempt to backfill gaps.
+    Strategy:
+      - Load CSV
+      - Build expected 1-minute timeline between earliest & latest (market hours only optional future enhancement)
+      - Find gaps > 1 minute (missing minutes)
+      - Batch adjacent missing minutes into contiguous ranges
+      - For each range, request bars via fetch_1min_bars and merge
+      - Preserve existing feed lock (do not mix feeds)
+    """
+    path = os.path.join(data_dir, f"{symbol}.csv")
+    if not os.path.exists(path):
+        print(f"[REPAIR] No data file for {symbol}")
+        return
+    try:
+        df = pd.read_csv(path)
+        # Infer timestamp col
+        ts_col = None
+        for c in ['timestamp','time','t','date','datetime']:
+            if c in df.columns:
+                ts_col = c
+                break
+        if ts_col is None:
+            ts_col = df.columns[0]
+        ts = pd.to_datetime(df[ts_col], errors='coerce', utc=True).dropna()
+        if ts.empty:
+            print(f"[REPAIR] No valid timestamps in {symbol} CSV")
+            return
+        ts = ts.sort_values()
+        earliest = ts.min()
+        latest = ts.max()
+        # Limit repair to last max_days_window days to control API usage
+        window_start = max(earliest, latest - pd.Timedelta(days=max_days_window))
+        ts_window = ts[ts >= window_start]
+        # Expected full minute index
+        full_index = pd.date_range(start=ts_window.min(), end=ts_window.max(), freq='T', tz=ts_window.dtype.tz)
+        missing = full_index.difference(ts_window)
+        if missing.empty:
+            print(f"[REPAIR] No gaps detected for {symbol} in last {max_days_window} days")
+            return
+        # Group missing into contiguous ranges
+        ranges = []
+        start = prev = missing[0]
+        for ts_m in missing[1:]:
+            if ts_m - prev > pd.Timedelta(minutes=1):
+                ranges.append((start, prev))
+                start = ts_m
+            prev = ts_m
+        ranges.append((start, prev))
+        print(colorama.Fore.MAGENTA + f"[REPAIR] {symbol} found {len(ranges)} gap range(s) covering {len(missing)} missing minutes." + colorama.Style.RESET_ALL)
+        # Determine feed enum
+        feed_enum = None
+        if StockDataFeed is not None:
+            if feed.upper() == 'IEX':
+                feed_enum = StockDataFeed.IEX
+            elif feed.upper() == 'SIP':
+                feed_enum = StockDataFeed.SIP
+        repaired_rows = 0
+        for a,b in ranges:
+            try:
+                # Expand a bit on boundaries to ensure coverage
+                rng_start = a - pd.Timedelta(minutes=2)
+                rng_end = b + pd.Timedelta(minutes=2)
+                add_df, _ = fetch_1min_bars(symbol, start=rng_start, end=rng_end, feed=feed_enum)
+                if add_df is None or add_df.empty:
+                    continue
+                # Normalize index for merge
+                merged = pd.concat([df, add_df.reset_index() if not set(add_df.columns).issubset(df.columns) else add_df])
+                # Drop duplicates by timestamp column heuristic
+                merged[ts_col] = pd.to_datetime(merged[ts_col], errors='coerce', utc=True)
+                merged = merged.dropna(subset=[ts_col]).drop_duplicates(subset=[ts_col]).sort_values(ts_col)
+                df = merged
+                repaired_rows += len(add_df)
+                print(colorama.Fore.CYAN + f"[REPAIR] Filled gap {a} -> {b} with {len(add_df)} rows" + colorama.Style.RESET_ALL)
+            except Exception as e:
+                print(colorama.Fore.RED + f"[REPAIR] Error repairing gap {a}->{b} for {symbol}: {e}" + colorama.Style.RESET_ALL)
+        # Save updated CSV
+        if repaired_rows > 0:
+            df.to_csv(path, index=False)
+            print(colorama.Fore.GREEN + f"[REPAIR] Completed repair for {symbol}; added {repaired_rows} rows." + colorama.Style.RESET_ALL)
+        else:
+            print(f"[REPAIR] No rows added for {symbol}")
+    except Exception as e:
+        print(colorama.Fore.RED + f"[REPAIR] Unexpected error repairing {symbol}: {e}" + colorama.Style.RESET_ALL)
