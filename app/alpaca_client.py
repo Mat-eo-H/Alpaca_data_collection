@@ -8,6 +8,15 @@ from alpaca.trading.requests import GetAssetsRequest
 from alpaca.trading.enums import AssetClass, AssetStatus
 from alpaca.common.exceptions import APIError
 from alpaca.common.enums import Sort
+try:
+    # Newer alpaca-py
+    from alpaca.data.enums import DataFeed as StockDataFeed
+except Exception:
+    try:
+        # Older alpaca-py
+        from alpaca.data.enums import StockDataFeed  # type: ignore
+    except Exception:
+        StockDataFeed = None  # feed selection not available in this version
 from requests.exceptions import RequestException
 from datetime import datetime, timedelta
 import time
@@ -15,10 +24,12 @@ import os
 import sys
 import pandas as pd
 import pytz
+import colorama
 from typing import Optional
 from config_local import API_KEY, API_SECRET, BASE_URL, BASE_DATA_DIR, MAX_RETRIES, RETRY_DELAY, CHUNK_DAYS, NY_TZ
 from app.utils import ensure_tz_aware
 from app.data_handler import save_bars_to_csv
+
 
 _data_connected_once = False
 
@@ -38,7 +49,7 @@ def connect_data():
         _data_connected_once = True
     return client
 
-def get_recent_bars(symbol: str, days: int = 1):
+def get_recent_bars(symbol: str, days: int = 90):
     """Fetch recent daily bars for a symbol."""
     data_client = connect_data()
     end_time = datetime.now(pytz.UTC) - timedelta(days=1)  # Exclude today
@@ -48,7 +59,7 @@ def get_recent_bars(symbol: str, days: int = 1):
         symbol_or_symbols=[symbol],
         start=start_time,
         end=end_time,
-        timeframe=TimeFrame.Day  # Use TimeFrame.Day instead of "1Day"
+        timeframe=TimeFrame.Minute  # Use TimeFrame.Minute instead of "1Day"
     )
     
     bars = data_client.get_stock_bars(request)
@@ -171,7 +182,7 @@ def sanitize_data_dir(data_dir: str):
         print(f"[MOVE] {file} → {new_path}")
         os.replace(file_path, new_path)
     
-def fetch_1min_bars(symbol, start: datetime, end: datetime, limit=10000) -> pd.DataFrame:
+def fetch_1min_bars(symbol, start: datetime, end: datetime, feed=None, limit=10000) -> pd.DataFrame:
     """
     Fetch all 1-minute bars for a symbol in the specified range using pagination.
     Returns a DataFrame with timestamp as index.
@@ -179,33 +190,114 @@ def fetch_1min_bars(symbol, start: datetime, end: datetime, limit=10000) -> pd.D
     data_client = connect_data()
 
     all_bars = []
+    total_rows = 0
+    pages = 0
+    saw_full_page_without_token = False
     current_start = start
     APIrequestDaysSize = 30  # max days per individual request (loops)
 
     while current_start < end:
-        current_end = min(current_start + timedelta(days=APIrequestDaysSize), end)  # fetch max 30 days per request
-        try:
-            request_params = StockBarsRequest(
+        current_end = min(current_start + timedelta(days=APIrequestDaysSize), end)
+        page_token = None
+        while True:
+            kwargs = dict(
                 symbol_or_symbols=symbol,
                 timeframe=TimeFrame.Minute,
                 start=current_start,
                 end=current_end,
-                adjustment="split"  # adjust for splits
+                adjustment="split",
             )
+            # Add feed and limit if supported by installed SDK
+            if feed is not None and StockDataFeed is not None:
+                try:
+                    request_params = StockBarsRequest(**{**kwargs, "feed": feed, "limit": limit, "page_token": page_token})
+                except TypeError:
+                    # Older SDKs may not accept feed/limit/page_token
+                    try:
+                        request_params = StockBarsRequest(**{**kwargs, "limit": limit, "page_token": page_token})
+                    except TypeError:
+                        request_params = StockBarsRequest(**kwargs)
+            else:
+                try:
+                    request_params = StockBarsRequest(**{**kwargs, "limit": limit, "page_token": page_token})
+                except TypeError:
+                    request_params = StockBarsRequest(**kwargs)
+
             bars = data_client.get_stock_bars(request_params)
             df = bars.df.copy() if bars else pd.DataFrame()
+            pages += 1
             if not df.empty:
+                total_rows += len(df)
                 all_bars.append(df)
-            current_start = current_end  # move to next chunk
-        except Exception as e:
-            print(f"Error fetching {symbol} from {current_start} to {current_end}: {e}")
-            raise  # stop on error to retry later
+                # Heuristic: page returned full limit but no token → may be truncated silently
+                if len(df) >= limit:
+                    # We'll also look for explicit next_page_token
+                    pass
+            # pagination token extraction across SDK variants
+            next_token = getattr(bars, "next_page_token", None)
+            if next_token in ("", None):
+                raw = getattr(bars, "raw", None)
+                if isinstance(raw, dict):
+                    next_token = raw.get("next_page_token")
+            # if limit hit and no explicit token, mark possible truncation
+            if next_token in ("", None) and (not df.empty) and len(df) >= limit:
+                saw_full_page_without_token = True
+            if not next_token:
+                break
+            page_token = next_token
+        current_start = current_end
+
     if all_bars:
         full_df = pd.concat(all_bars).sort_index()
-        # Remove duplicates if any
         full_df = full_df[~full_df.index.duplicated(keep='first')]
-        return full_df
-    return pd.DataFrame()
+        # Compute coverage meta
+        if isinstance(full_df.index, pd.MultiIndex):
+            ts_index = full_df.index.get_level_values('timestamp') if 'timestamp' in full_df.index.names else full_df.index.get_level_values(-1)
+        else:
+            ts_index = full_df.index
+        try:
+            earliest = pd.to_datetime(ts_index.min()).tz_convert(NY_TZ)
+            latest = pd.to_datetime(ts_index.max()).tz_convert(NY_TZ)
+        except Exception:
+            earliest = pd.NaT
+            latest = pd.NaT
+        # Truncation signal: saw_full_page_without_token OR coverage gap relative to requested window
+        coverage_gap = False
+        try:
+            if pd.notna(earliest) and pd.notna(latest):
+                # allow a 2-minute slack at edges
+                coverage_gap = (earliest > (start + timedelta(minutes=2))) or (latest < (end - timedelta(minutes=2)))
+        except Exception:
+            coverage_gap = False
+        truncated = bool(saw_full_page_without_token or coverage_gap)
+        meta = {"truncated": truncated, "earliest": earliest, "latest": latest, "pages": pages, "count": int(total_rows)}
+        return full_df, meta
+    return pd.DataFrame(), {"truncated": False, "earliest": pd.NaT, "latest": pd.NaT, "pages": 0, "count": 0}
+
+def _get_symbol_data_span_days(data_dir: str, symbol: str) -> float:
+    """Return the span in days of existing CSV for symbol; 0 if none/unknown."""
+    try:
+        path = os.path.join(data_dir, f"{symbol}.csv")
+        if not os.path.exists(path):
+            return 0.0
+        df = pd.read_csv(path)
+        # Try to find a timestamp column, else use index
+        ts_col = None
+        for c in ['timestamp', 'time', 't', 'date', 'datetime']:
+            if c in df.columns:
+                ts_col = c
+                break
+        if ts_col is None:
+            # assume first column is timestamp/index
+            ts_col = df.columns[0]
+        ts = pd.to_datetime(df[ts_col], errors='coerce', utc=True)
+        ts = ts.dropna()
+        if ts.empty:
+            return 0.0
+        span = (ts.max() - ts.min()).total_seconds() / 86400.0
+        return float(span)
+    except Exception:
+        return 0.0
 
 def fetch_oldest_bar_date(symbol: str) -> pd.Timestamp:
     """
@@ -221,7 +313,7 @@ def fetch_oldest_bar_date(symbol: str) -> pd.Timestamp:
             timeframe=TimeFrame.Day,
             start=datetime(1900, 1, 1),   # naive OK; server treats as UTC
             limit=1,
-            adjustment="raw",
+            adjustment="split",
             sort=Sort.ASC
         )
         bars = data_client.get_stock_bars(req)
@@ -297,7 +389,7 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
         )
 
     # 3) ensure required columns exist
-    for col, default in [('last_end', pd.NaT), ('oldest_date', pd.NaT), ('complete', False)]:
+    for col, default in [('last_end', pd.NaT), ('oldest_date', pd.NaT), ('complete', False), ('feed', '')]:
         if col not in state.columns:
             state[col] = default
 
@@ -307,7 +399,8 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
         new_rows = pd.DataFrame({
             'last_end': pd.NaT,
             'oldest_date': pd.NaT,
-            'complete': False
+            'complete': False,
+            'feed': ''
         }, index=pd.Index(missing, name='symbol'))
         state = pd.concat([state, new_rows], axis=0)
 
@@ -327,14 +420,27 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
     state.to_csv(STATE_FILE)
         
 
-    # Fill missing oldest_date via API, once
+    # Fill oldest_date via API only for new symbols, unless it's the first day of a quarter.
     oldestDateAPICallCounter = 0
-    for symbol in symbols:  # <-- use normalized list
-        if symbol not in state.index:
-            # belt & suspenders — should be covered by your align step
-            state.loc[symbol, ['last_end','oldest_date','complete']] = [pd.NaT, pd.NaT, False]
+    today_ny = pd.Timestamp.now(tz=NY_TZ)
+    is_quarter_start = (today_ny.month in (1, 4, 7, 10)) and (today_ny.day == 1)
 
-        if pd.isna(state.loc[symbol, 'oldest_date']):
+    for symbol in symbols:  # normalized list
+        # Ensure row exists
+        if symbol not in state.index:
+            state.loc[symbol, ['last_end', 'oldest_date', 'complete', 'feed']] = [pd.NaT, pd.NaT, False, '']
+
+        # Determine if symbol is "new" to the database: no CSV in DATA_DIR
+        sym_csv = os.path.join(DATA_DIR, f"{symbol}.csv")
+        is_new_symbol = not os.path.exists(sym_csv)
+
+        # Only fetch oldest_date from API if:
+        # - it's the first day of a quarter (refresh all), OR
+        # - this is a new symbol with no existing CSV (bootstrap), OR
+        # - oldest_date is missing and there is no CSV yet
+        need_api = is_quarter_start or is_new_symbol or (pd.isna(state.loc[symbol, 'oldest_date']) and is_new_symbol)
+
+        if need_api:
             try:
                 api_oldest_ts = fetch_oldest_bar_date(symbol)
                 if pd.notna(api_oldest_ts):
@@ -359,10 +465,31 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
     symbols_remaining = set(state.index[state['complete'] == False])
     now = pd.Timestamp.now(tz=NY_TZ) - timedelta(days=1)  # one-day buffer
 
+    fixed_cutoff = pd.Timestamp("2022-01-01", tz=NY_TZ).normalize()
+    for symbol in symbols:
+        if pd.isna(state.loc[symbol, 'oldest_date']):
+            state.loc[symbol, 'oldest_date'] = fixed_cutoff
+        else:
+            state.loc[symbol, 'oldest_date'] = max(state.loc[symbol, 'oldest_date'], fixed_cutoff)
+
     while symbols_remaining:
         for symbol in list(symbols_remaining):
             oldest_date = state.loc[symbol, 'oldest_date']
             last_end = state.loc[symbol, 'last_end']
+            feed_str = ''
+            try:
+                feed_str = str(state.loc[symbol, 'feed']) if not pd.isna(state.loc[symbol, 'feed']) else ''
+            except Exception:
+                feed_str = ''
+            # lock feed if set in state
+            chosen_feed = None
+            if StockDataFeed is not None:
+                if feed_str.upper() == 'IEX':
+                    chosen_feed = StockDataFeed.IEX
+                elif feed_str.upper() == 'SIP':
+                    chosen_feed = StockDataFeed.SIP
+                else:
+                    chosen_feed = None  # will default to SIP attempt first
 
             # Determine end_date boundary (move backward)
             end_date = now if pd.isna(last_end) else last_end
@@ -383,27 +510,31 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
             while retries < MAX_RETRIES:
                 try:
                     print(f"[FETCH] {symbol} from {start_date} to {end_date}")
-                    # IMPORTANT: Correct call signature (no trading_client as first arg)
-                    bars_df = fetch_1min_bars(symbol, start=start_date, end=end_date)
+                    # Decide primary feed for this attempt
+                    primary_feed = chosen_feed if chosen_feed is not None else (StockDataFeed.SIP if StockDataFeed is not None else None)
+                    bars_df, meta = fetch_1min_bars(symbol, start=start_date, end=end_date, feed=primary_feed)
 
                     if bars_df.empty:
-                           # Only mark complete when we've reached or crossed the oldest boundary
-                            if pd.notna(oldest_date) and (start_date <= oldest_date):
-                                print(f"[INFO] No more bars for {symbol}; marking complete.")
-                                state.loc[symbol, 'complete'] = True
-                                symbols_remaining.remove(symbol)
-                            else:
-                                print(f"[INFO] No bars returned for {symbol} in this chunk; keeping symbol active (likely data gap or temp issue).")
-                            # Do NOT advance last_end on an empty result
-                            tmp = STATE_FILE + ".tmp"
-                            state.to_csv(tmp)
-                            state.to_csv(STATE_FILE)
-                            break
+                        # Do not advance dates on empty; only mark complete if we're at or past the oldest boundary
+                        if pd.notna(oldest_date) and (start_date <= oldest_date):
+                            print(colorama.Fore.LIGHTCYAN_EX, f"[INFO] No more bars for {symbol}; marking complete.", colorama.Style.RESET_ALL)
+                            state.loc[symbol, 'complete'] = True
+                            symbols_remaining.remove(symbol)
+                        # Persist state and continue
+                        tmp = STATE_FILE + ".tmp"
+                        state.to_csv(tmp)
+                        state.to_csv(STATE_FILE)
+                        break
 
                     save_bars_to_csv(bars_df, symbol, DATA_DIR)
 
-                    # Move boundary older by one chunk: next loop will fetch further back
-                    state.loc[symbol, 'last_end'] = start_date
+                    # If truncated/incomplete coverage, warn loudly and use the earliest timestamp actually saved
+                    if meta.get('truncated', False):
+                        print(colorama.Fore.MAGENTA + f"[WARN] Bars possibly truncated for {symbol} ({meta.get('count')} rows across {meta.get('pages')} page(s))." + colorama.Style.RESET_ALL)
+                        print(colorama.Fore.CYAN + f"[WARN] Coverage from {meta.get('earliest')} to {meta.get('latest')} may not span the requested window {start_date} to {end_date}." + colorama.Style.RESET_ALL)
+                    # Move boundary older using the earliest actual bar saved (prevents gaps when coverage is sparse)
+                    earliest_ts = meta.get('earliest', None)
+                    state.loc[symbol, 'last_end'] = earliest_ts if pd.notna(earliest_ts) else start_date
 
                     # Save state atomically after each success
                     tmp = STATE_FILE + ".tmp"
@@ -412,10 +543,61 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
                     break
 
                 except (RequestException, APIError, ConnectionError) as e:
-                    retries += 1
-                    wait_time = RETRY_DELAY * retries
-                    print(f"[ERROR] {symbol}: {e} — retry {retries}/{MAX_RETRIES} in {wait_time}s...")
-                    time.sleep(wait_time)
+                    # If SIP is failing and we're not locked to IEX, consider fallback based on 3-month rule
+                    if StockDataFeed is not None:
+                        is_primary_sip = (chosen_feed is None) or (chosen_feed == StockDataFeed.SIP)
+                    else:
+                        is_primary_sip = False
+
+                    if is_primary_sip and (feed_str.upper() != 'IEX') and StockDataFeed is not None:
+                        span_days = _get_symbol_data_span_days(DATA_DIR, symbol)
+                        has_3_months = span_days >= 90.0
+                        if has_3_months:
+                            print(colorama.Fore.YELLOW + f"[INFO] SIP failed for {symbol}, but >=3 months of data exists; not switching to IEX." + colorama.Style.RESET_ALL)
+                            state.loc[symbol, 'complete'] = True
+                            symbols_remaining.remove(symbol)
+                            tmp = STATE_FILE + ".tmp"
+                            state.to_csv(tmp)
+                            state.to_csv(STATE_FILE)
+                            break
+                        else:
+                            # Try IEX; if it works, lock symbol to IEX and rebuild from beginning
+                            try:
+                                df_probe, _ = fetch_1min_bars(symbol, start=start_date, end=end_date, feed=StockDataFeed.IEX)
+                                # Lock to IEX and reset state
+                                if df_probe is not None and not df_probe.empty:
+                                    state.loc[symbol, 'feed'] = 'IEX'
+                                    state.loc[symbol, 'last_end'] = pd.NaT
+                                    state.loc[symbol, 'complete'] = False
+                                    # Remove existing CSV to avoid mixing feeds
+                                    sym_csv = os.path.join(DATA_DIR, f"{symbol}.csv")
+                                    if os.path.exists(sym_csv):
+                                        os.remove(sym_csv)
+                                    print(colorama.Fore.CYAN + f"[SWITCH] Switching {symbol} to IEX and rebuilding entire dataset from beginning." + colorama.Style.RESET_ALL)
+                                    tmp = STATE_FILE + ".tmp"
+                                    state.to_csv(tmp)
+                                    state.to_csv(STATE_FILE)
+                                    # Break retry loop; next outer iteration will fetch using IEX
+                                    break
+                                else:
+                                    # IEX probe yielded no data; fall back to normal retry
+                                    retries += 1
+                                    wait_time = RETRY_DELAY * retries
+                                    print(f"[ERROR] {symbol}: {e} — retry {retries}/{MAX_RETRIES} in {wait_time}s...")
+                                    time.sleep(wait_time)
+                                    continue
+                            except Exception as e2:
+                                # Fallback failed; proceed with normal retry
+                                retries += 1
+                                wait_time = RETRY_DELAY * retries
+                                print(f"[ERROR] {symbol}: {e} — retry {retries}/{MAX_RETRIES} in {wait_time}s...")
+                                time.sleep(wait_time)
+                                continue
+                    else:
+                        retries += 1
+                        wait_time = RETRY_DELAY * retries
+                        print(f"[ERROR] {symbol}: {e} — retry {retries}/{MAX_RETRIES} in {wait_time}s...")
+                        time.sleep(wait_time)
 
             else:
                 print(f"[FATAL] Skipping {symbol} after {MAX_RETRIES} retries.")

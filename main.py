@@ -11,9 +11,11 @@ def main():
     print(f"Account status: {account.status}")
 
     # Example: get recent bars
-    bars = get_recent_bars("AAPL", days=3)
+    bars = get_recent_bars("AAPL", days=30)
     for bar in bars["AAPL"]:
         print(bar)
+    print("✅ Recent bars fetched", len(bars["AAPL"]), "This confirms API_KEY and API_SECRET are valid and connected to Alpaca")
+
 
     # Get tradeable symbols
     symbols_df = get_tradeable_symbols_df(trading_client=trading_client)
