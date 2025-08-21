@@ -461,6 +461,9 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
     state.to_csv(tmp)
     state.to_csv(STATE_FILE)
 
+    # Ensure state is in ABC order before starting fetch loop
+    state = state.sort_index()
+    state.to_csv(STATE_FILE)
 
     symbols_remaining = set(state.index[state['complete'] == False])
     now = pd.Timestamp.now(tz=NY_TZ) - timedelta(days=1)  # one-day buffer
@@ -473,7 +476,8 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
             state.loc[symbol, 'oldest_date'] = max(state.loc[symbol, 'oldest_date'], fixed_cutoff)
 
     while symbols_remaining:
-        for symbol in list(symbols_remaining):
+        # Iterate in alphabetical order for determinism
+        for symbol in sorted(list(symbols_remaining)):
             oldest_date = state.loc[symbol, 'oldest_date']
             last_end = state.loc[symbol, 'last_end']
             feed_str = ''
