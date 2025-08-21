@@ -795,18 +795,18 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
                             print(colorama.Fore.LIGHTBLUE_EX + f"[EDGE-OLD] Missing {len(older_missing_days)} earlier AAPL trading day(s) for {symbol} before {first_sym_day}; boundary set to {state.loc[symbol, 'oldest_date'].date()}." + colorama.Style.RESET_ALL)
                         # Newer edge forward fill attempts only for full missing trading days
                         if newer_missing_days:
-                            slack = timedelta(minutes=2)
                             attempts = 0
+                            attempted_days = []
                             latest_cov = meta.get('latest')
-                            # Fetch each missing day individually until up-to-date with end_date AAPL days
+                            chunk_last_day = min(end_date.normalize().date(), max(aapl_days) if aapl_days else end_date.normalize().date())
                             for d in newer_missing_days:
-                                # Don't go beyond requested end chunk
+                                if d > chunk_last_day:
+                                    break  # outside chunk scope
                                 day_start = pd.Timestamp(d, tz=NY_TZ)
-                                if day_start > end_date:
-                                    break
                                 day_end = day_start + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
                                 print(colorama.Fore.YELLOW + f"[EDGE-NEW] Filling missing trading day {d} for {symbol}" + colorama.Style.RESET_ALL)
                                 add_df, add_meta = fetch_1min_bars(symbol, start=day_start, end=day_end, feed=primary_feed)
+                                attempted_days.append(d)
                                 if add_df is not None and not add_df.empty:
                                     if isinstance(add_df.index, pd.MultiIndex):
                                         add_idx = add_df.index.get_level_values('timestamp') if 'timestamp' in add_df.index.names else add_df.index.get_level_values(-1)
@@ -817,22 +817,28 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
                                     latest_cov = add_meta.get('latest', latest_cov)
                                     print(colorama.Fore.GREEN + f"[EDGE-NEW] Added {len(add_df)} bars for {symbol} on {d}" + colorama.Style.RESET_ALL)
                                 else:
+                                    # treat illiquid day as covered: update newest_date if this day is newer
+                                    if 'newest_date' in state.columns:
+                                        try:
+                                            nd_day = pd.Timestamp(d, tz=NY_TZ)
+                                            if pd.isna(state.loc[symbol, 'newest_date']) or nd_day > state.loc[symbol, 'newest_date']:
+                                                state.loc[symbol, 'newest_date'] = nd_day
+                                        except Exception:
+                                            pass
                                     print(colorama.Fore.YELLOW + f"[EDGE-NEW] No trades for {symbol} on {d}; treating as illiquid." + colorama.Style.RESET_ALL)
                                 attempts += 1
-                            # Recompute earliest/latest after edge fills
+                            # Recompute earliest/latest after any added bars
                             if isinstance(bars_df.index, pd.MultiIndex):
                                 ts_idx_all = bars_df.index.get_level_values('timestamp') if 'timestamp' in bars_df.index.names else bars_df.index.get_level_values(-1)
                             else:
                                 ts_idx_all = bars_df.index
-                            meta['earliest'] = pd.to_datetime(ts_idx_all.min()).tz_convert(NY_TZ)
-                            meta['latest'] = pd.to_datetime(ts_idx_all.max()).tz_convert(NY_TZ)
-                        # Only warn if there remain AAPL trading days beyond latest after attempts
-                        if 'newer_missing_days' in locals() and newer_missing_days:
-                            last_aapl_day = max(aapl_days) if aapl_days else None
-                            if last_aapl_day and last_aapl_day > max(symbol_days):
-                                missing_remaining = len([d for d in newer_missing_days if d > max(symbol_days)])
-                                if missing_remaining:
-                                    print(colorama.Fore.MAGENTA + f"[WARN] {symbol} still missing {missing_remaining} recent AAPL trading day(s) up to {last_aapl_day}." + colorama.Style.RESET_ALL)
+                            if len(bars_df):
+                                meta['earliest'] = pd.to_datetime(ts_idx_all.min()).tz_convert(NY_TZ)
+                                meta['latest'] = pd.to_datetime(ts_idx_all.max()).tz_convert(NY_TZ)
+                            # Warn only if there are AAPL days within chunk not attempted
+                            remaining_unattempted = [d for d in newer_missing_days if d <= chunk_last_day and d not in attempted_days]
+                            if remaining_unattempted:
+                                print(colorama.Fore.MAGENTA + f"[WARN] {symbol} still missing {len(remaining_unattempted)} AAPL trading day(s) in chunk up to {chunk_last_day}." + colorama.Style.RESET_ALL)
                         # Update state newest_date after fills
                         latest_for_newest = meta.get('latest')
                         if latest_for_newest is not None and pd.notna(latest_for_newest):
