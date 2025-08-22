@@ -37,6 +37,36 @@ _aapl_days: set = set()
 _aapl_earliest_day: Optional[pd.Timestamp] = None
 _aapl_latest_day: Optional[pd.Timestamp] = None
 
+def _parse_csv_times(df: pd.DataFrame) -> pd.Series:
+    """Return tz-aware (NY) pandas Series of timestamps from a bars CSV.
+    Preference order:
+      1. 'timestamp' column (assumed ISO / offset aware or naive UTC) -> parse utc=True then convert to NY.
+      2. Reconstruct from 'date' + 'time' columns (naive local) -> localize to NY directly.
+    Falls back to empty Series on failure.
+    """
+    try:
+        if 'timestamp' in df.columns:
+            ts = pd.to_datetime(df['timestamp'], errors='coerce', utc=True)
+            ts = ts.dropna()
+            if ts.empty:
+                return ts
+            return ts.dt.tz_convert(NY_TZ)
+        if 'date' in df.columns and 'time' in df.columns:
+            raw = df['date'].astype(str) + ' ' + df['time'].astype(str)
+            ts = pd.to_datetime(raw, errors='coerce')
+            ts = ts.dropna()
+            if ts.empty:
+                return ts
+            # Treat combined date+time as already in NY local clock
+            if ts.dt.tz is None:
+                ts = ts.dt.tz_localize(NY_TZ, nonexistent='NaT', ambiguous='NaT')
+            else:
+                ts = ts.dt.tz_convert(NY_TZ)
+            return ts
+    except Exception:
+        return pd.Series([], dtype='datetime64[ns]')
+    return pd.Series([], dtype='datetime64[ns]')
+
 def _get_aapl_trading_days(start: datetime, end: datetime) -> set:
     """Return set of NY date objects where AAPL traded between start/end using local AAPL.csv.
     Only fetch from API when: (a) AAPL.csv missing, or (b) we require dates earlier than current earliest coverage.
@@ -51,24 +81,27 @@ def _get_aapl_trading_days(start: datetime, end: datetime) -> set:
         if not _aapl_days_loaded and os.path.exists(aapl_path):
             try:
                 df_existing = pd.read_csv(aapl_path)
-                # attempt timestamp reconstruction from date + time
-                if 'date' in df_existing.columns and 'time' in df_existing.columns:
-                    ts = pd.to_datetime(df_existing['date'].astype(str) + ' ' + df_existing['time'].astype(str), errors='coerce')
+                if 'date' in df_existing.columns:
+                    date_series = pd.to_datetime(df_existing['date'].astype(str), errors='coerce')
+                    date_series = date_series.dropna()
+                    if not date_series.empty:
+                        _aapl_days = set(date_series.dt.date)
+                        _aapl_earliest_day = pd.Timestamp(min(_aapl_days), tz=NY_TZ)
+                        _aapl_latest_day = pd.Timestamp(max(_aapl_days), tz=NY_TZ)
                 else:
-                    # fallback: any plausible timestamp column
+                    # fallback: attempt to parse any timestamp-like column
                     ts_col = None
-                    for c in ['timestamp','time','t','datetime','date']:
+                    for c in ['timestamp','datetime','t','time']:
                         if c in df_existing.columns:
-                            ts_col = c; break
-                    if ts_col is None:
-                        ts = pd.Series([], dtype='datetime64[ns]')
-                    else:
-                        ts = pd.to_datetime(df_existing[ts_col], errors='coerce')
-                ts = ts.dropna().dt.tz_localize(NY_TZ, nonexistent='NaT', ambiguous='NaT') if ts.dt.tz is None else ts.dt.tz_convert(NY_TZ)
-                if not ts.empty:
-                    _aapl_days = set(ts.dt.date)
-                    _aapl_earliest_day = pd.Timestamp(min(_aapl_days), tz=NY_TZ)
-                    _aapl_latest_day = pd.Timestamp(max(_aapl_days), tz=NY_TZ)
+                            ts_col = c
+                            break
+                    if ts_col:
+                        ts = pd.to_datetime(df_existing[ts_col], errors='coerce', utc=True).dropna()
+                        if not ts.empty:
+                            ts = ts.tz_convert(NY_TZ)
+                            _aapl_days = set(ts.date)
+                            _aapl_earliest_day = pd.Timestamp(min(_aapl_days), tz=NY_TZ)
+                            _aapl_latest_day = pd.Timestamp(max(_aapl_days), tz=NY_TZ)
                 _aapl_days_loaded = True
             except Exception as ee:
                 print(colorama.Fore.RED + f"[AAPL] Error loading existing AAPL.csv: {ee}" + colorama.Style.RESET_ALL)
@@ -182,6 +215,155 @@ def _fill_edge_days(symbol: str, bars_df: pd.DataFrame, start: datetime, end: da
             else:
                 print(colorama.Fore.YELLOW + f"[EDGE] No trades for {symbol} on {d}; accepting as illiquid day." + colorama.Style.RESET_ALL)
     return bars_df
+
+def ensure_aapl_forward_fill(max_back_days: int = 180):
+    """Ensure AAPL.csv (mask source) is forward-filled through 'yesterday' (NY).
+    If file missing: fetch last `max_back_days` days (yesterday inclusive) as seed.
+    If existing but stale (latest < yesterday): fetch missing forward span only.
+    Updates global mask variables so subsequent _get_aapl_trading_days calls see new days.
+    """
+    global _aapl_days_loaded, _aapl_days, _aapl_earliest_day, _aapl_latest_day
+    try:
+        data_dir = os.path.join(BASE_DATA_DIR, "1mintrades")
+        os.makedirs(data_dir, exist_ok=True)
+        aapl_path = os.path.join(data_dir, 'AAPL.csv')
+        yesterday_ny = (pd.Timestamp.now(tz=NY_TZ) - pd.Timedelta(days=1)).normalize()
+        # Load existing if not loaded
+        if (not _aapl_days_loaded) and os.path.exists(aapl_path):
+            try:
+                df_exist = pd.read_csv(aapl_path)
+                if 'date' in df_exist.columns:
+                    date_series = pd.to_datetime(df_exist['date'].astype(str), errors='coerce').dropna()
+                    if not date_series.empty:
+                        _aapl_days = set(date_series.dt.date)
+                        _aapl_earliest_day = pd.Timestamp(min(_aapl_days), tz=NY_TZ)
+                        _aapl_latest_day = pd.Timestamp(max(_aapl_days), tz=NY_TZ)
+                else:
+                    ts_col = None
+                    for c in ['timestamp','datetime','t','time']:
+                        if c in df_exist.columns:
+                            ts_col = c
+                            break
+                    if ts_col:
+                        ts = pd.to_datetime(df_exist[ts_col], errors='coerce', utc=True).dropna()
+                        if not ts.empty:
+                            ts = ts.tz_convert(NY_TZ)
+                            _aapl_days = set(ts.date)
+                            _aapl_earliest_day = pd.Timestamp(min(_aapl_days), tz=NY_TZ)
+                            _aapl_latest_day = pd.Timestamp(max(_aapl_days), tz=NY_TZ)
+                _aapl_days_loaded = True
+            except Exception as le:
+                print(colorama.Fore.RED + f"[AAPL-FWD] Error loading existing AAPL.csv: {le}" + colorama.Style.RESET_ALL)
+                _aapl_days_loaded = True
+        # If missing entirely or empty -> seed fetch
+        if not _aapl_days:
+            seed_start = yesterday_ny - pd.Timedelta(days=max_back_days)
+            seed_end = yesterday_ny + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+            feed_enum = StockDataFeed.SIP if StockDataFeed is not None else None
+            df_seed, _ = fetch_1min_bars('AAPL', start=seed_start, end=seed_end, feed=feed_enum)
+            if df_seed is not None and not df_seed.empty:
+                save_bars_to_csv(df_seed, 'AAPL', data_dir)
+                if isinstance(df_seed.index, pd.MultiIndex):
+                    ts_idx = df_seed.index.get_level_values('timestamp') if 'timestamp' in df_seed.index.names else df_seed.index.get_level_values(-1)
+                else:
+                    ts_idx = df_seed.index
+                ts_idx = pd.DatetimeIndex(ts_idx).tz_convert(NY_TZ)
+                _aapl_days = set(ts_idx.date)
+                _aapl_earliest_day = pd.Timestamp(min(_aapl_days), tz=NY_TZ)
+                _aapl_latest_day = pd.Timestamp(max(_aapl_days), tz=NY_TZ)
+                print(colorama.Fore.CYAN + f"[AAPL-FWD] Seeded AAPL mask { _aapl_earliest_day.date()} -> {_aapl_latest_day.date()} ({len(_aapl_days)} days)." + colorama.Style.RESET_ALL)
+            return
+        # Forward fill if stale
+        if _aapl_latest_day is not None and _aapl_latest_day.date() < yesterday_ny.date():
+            fwd_start = _aapl_latest_day + pd.Timedelta(days=1)
+            fwd_end = yesterday_ny + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+            feed_enum = StockDataFeed.SIP if StockDataFeed is not None else None
+            df_new, _ = fetch_1min_bars('AAPL', start=fwd_start, end=fwd_end, feed=feed_enum)
+            if df_new is not None and not df_new.empty:
+                # append
+                save_bars_to_csv(df_new, 'AAPL', data_dir)
+                if isinstance(df_new.index, pd.MultiIndex):
+                    ts_idx2 = df_new.index.get_level_values('timestamp') if 'timestamp' in df_new.index.names else df_new.index.get_level_values(-1)
+                else:
+                    ts_idx2 = df_new.index
+                ts_idx2 = pd.DatetimeIndex(ts_idx2).tz_convert(NY_TZ)
+                new_days = set(ts_idx2.date)
+                _aapl_days.update(new_days)
+                _aapl_latest_day = pd.Timestamp(max(_aapl_days), tz=NY_TZ)
+                _aapl_earliest_day = pd.Timestamp(min(_aapl_days), tz=NY_TZ)
+                print(colorama.Fore.CYAN + f"[AAPL-FWD] Forward-filled AAPL mask now {_aapl_earliest_day.date()} -> {_aapl_latest_day.date()} ({len(_aapl_days)} days)." + colorama.Style.RESET_ALL)
+        else:
+            # Already up-to-date
+            if _aapl_latest_day is not None:
+                print(colorama.Fore.CYAN + f"[AAPL-FWD] AAPL mask already current through {_aapl_latest_day.date()}." + colorama.Style.RESET_ALL)
+    except Exception as e:
+        print(colorama.Fore.RED + f"[AAPL-FWD] Unexpected forward-fill error: {e}" + colorama.Style.RESET_ALL)
+
+def sync_state_from_csvs(state: pd.DataFrame, data_dir: str, symbols: list[str]) -> pd.DataFrame:
+    """Reconcile state file with actual CSV contents: CSVs are source of truth.
+    For each symbol CSV present:
+      - Load date/time (and timestamp if present)
+      - Derive earliest and latest trading day
+      - Update state.oldest_date/newest_date if CSV shows broader coverage
+      - If last_end is NaT but we have data, set last_end to earliest timestamp (so backward fetch starts earlier only if needed)
+    Avoid heavy parsing by reading only needed columns.
+    """
+    updated_oldest = 0
+    updated_newest = 0
+    initialized_last_end = 0
+    for sym in symbols:
+        csv_path = os.path.join(data_dir, f"{sym}.csv")
+        if not os.path.exists(csv_path):
+            continue
+        try:
+            # Read minimal columns. We don't know order, so read all then subset.
+            df = pd.read_csv(csv_path)
+            if df.empty:
+                continue
+            # Clean: drop duplicate date+time (or timestamp) and sort
+            cleaned = False
+            if 'date' in df.columns and 'time' in df.columns:
+                before = len(df)
+                df = df.drop_duplicates(subset=['date','time']).sort_values(['date','time'])
+                if len(df) != before:
+                    cleaned = True
+            elif 'timestamp' in df.columns:
+                before = len(df)
+                df = df.drop_duplicates(subset=['timestamp']).sort_values(['timestamp'])
+                if len(df) != before:
+                    cleaned = True
+            if cleaned:
+                # Rewrite cleaned CSV to establish canonical ordering
+                try:
+                    df.to_csv(csv_path, index=False)
+                    print(colorama.Fore.LIGHTBLUE_EX + f"[SYNC] Cleaned duplicates in {sym} (rewrote CSV)." + colorama.Style.RESET_ALL)
+                except Exception as e_w:
+                    print(colorama.Fore.YELLOW + f"[SYNC] Failed rewrite for {sym}: {e_w}" + colorama.Style.RESET_ALL)
+            ts = _parse_csv_times(df)
+            if ts.empty:
+                continue
+            earliest_ts = ts.min()
+            latest_ts = ts.max()
+            earliest_day = earliest_ts.normalize()
+            latest_day = latest_ts.normalize()
+            # Update oldest_date
+            if pd.isna(state.loc[sym, 'oldest_date']) or earliest_day < state.loc[sym, 'oldest_date']:
+                state.loc[sym, 'oldest_date'] = earliest_day
+                updated_oldest += 1
+            # Update newest_date
+            if 'newest_date' in state.columns:
+                if pd.isna(state.loc[sym, 'newest_date']) or latest_day > state.loc[sym, 'newest_date']:
+                    state.loc[sym, 'newest_date'] = latest_day
+                    updated_newest += 1
+            # Initialize last_end if NaT so we don't refetch already covered range
+            if pd.isna(state.loc[sym, 'last_end']):
+                # Set last_end to earliest_ts so algorithm will detect completion if oldest_date equals this day
+                state.loc[sym, 'last_end'] = earliest_ts
+                initialized_last_end += 1
+        except Exception as e_sym_sync:
+            print(colorama.Fore.YELLOW + f"[SYNC] Skipped {sym} due to error: {e_sym_sync}" + colorama.Style.RESET_ALL)
+    print(colorama.Fore.CYAN + f"[SYNC] State reconciled with CSVs: oldest_date updates={updated_oldest}, newest_date updates={updated_newest}, initialized last_end={initialized_last_end}." + colorama.Style.RESET_ALL)
+    return state
 
 def connect_trading():
     """Connect to Alpaca trading API."""
@@ -499,31 +681,39 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
         state = pd.read_csv(STATE_FILE, index_col='symbol')
 
         # Parse to UTC (handles mixed/naive tz safely), then convert to NY time
-        state['last_end'] = pd.to_datetime(state['last_end'], errors='coerce', utc=True)\
-                            .dt.tz_convert(NY_TZ)
-
-        # If oldest_date is date-only or mixed tz, do the same; .normalize() -> midnight NY
-        if 'oldest_date' not in state.columns:
-            state['oldest_date'] = pd.Series(pd.NaT, dtype="datetime64[ns, America/New_York]")
+        if 'last_end' in state.columns:
+            state['last_end'] = pd.to_datetime(state['last_end'], errors='coerce', utc=True).dt.tz_convert(NY_TZ)
         else:
+            state['last_end'] = pd.NaT
+
+        # oldest_date normalize
+        if 'oldest_date' in state.columns:
             state['oldest_date'] = pd.to_datetime(state['oldest_date'], errors='coerce', utc=True).dt.tz_convert(NY_TZ)
+        else:
+            state['oldest_date'] = pd.Series(pd.NaT, dtype="datetime64[ns, America/New_York]")
 
-
-        # 'complete' column fallback
+        # complete fallback only if missing
         if 'complete' not in state.columns:
             state['complete'] = False
-        # newest_date column fallback
-        if 'newest_date' not in state.columns:
-            state['newest_date'] = pd.NaT
-        else:
+
+        # newest_date fallback (preserve existing)
+        if 'newest_date' in state.columns:
             state['newest_date'] = pd.to_datetime(state['newest_date'], errors='coerce', utc=True).dt.tz_convert(NY_TZ).dt.normalize()
+        else:
+            state['newest_date'] = pd.NaT
+
+        try:
+            completed_count = int(state['complete'].sum()) if 'complete' in state.columns else 0
+            print(f"[STATE] Loaded {len(state)} symbols from {STATE_FILE}; {completed_count} marked complete.")
+        except Exception:
+            print(f"[STATE] Loaded {len(state)} symbols from {STATE_FILE}.")
     else:
         # fresh state
         state = pd.DataFrame(index=symbols_df['symbol'].tolist())
         state['last_end'] = pd.NaT
         state['oldest_date'] = pd.NaT
-    state['complete'] = False
-    state['newest_date'] = pd.NaT
+        state['complete'] = False
+        state['newest_date'] = pd.NaT
 
     # --- normalize and align state with symbols_df ---
 
@@ -567,17 +757,14 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
     # 5) optional: sort & de-dup the index
     state = state[~state.index.duplicated(keep='first')].sort_index()
 
-    # 6) persist immediately (two writes; leave .tmp)
-    tmp = STATE_FILE + ".tmp"
-
-    # write tmp with fsync
-    with open(tmp, "w", newline="", encoding="utf-8") as f:
-        state.to_csv(f)
-        f.flush()
-        os.fsync(f.fileno())
-
-    # write final (no fsync)
-    state.to_csv(STATE_FILE)
+    # 6) persist immediately only if brand new state (i.e., file did not exist before)
+    if not os.path.exists(STATE_FILE):
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            state.to_csv(f)
+            f.flush()
+            os.fsync(f.fileno())
+        state.to_csv(STATE_FILE)
         
 
     # Fill oldest_date via API only for new symbols, unless it's the first day of a quarter.
@@ -585,26 +772,38 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
     today_ny = pd.Timestamp.now(tz=NY_TZ)
     is_quarter_start = (today_ny.month in (1, 4, 7, 10)) and (today_ny.day == 1)
 
+    # Ensure helper column exists for caching oldest-date fetch
+    if 'oldest_fetched_at' not in state.columns:
+        state['oldest_fetched_at'] = pd.NaT
+
     for symbol in symbols:  # normalized list
         # Ensure row exists
         if symbol not in state.index:
-            state.loc[symbol, ['last_end', 'oldest_date', 'complete', 'feed', 'newest_date']] = [pd.NaT, pd.NaT, False, '', pd.NaT]
+            state.loc[symbol, ['last_end', 'oldest_date', 'complete', 'feed', 'newest_date', 'oldest_fetched_at']] = [pd.NaT, pd.NaT, False, '', pd.NaT, pd.NaT]
 
         # Determine if symbol is "new" to the database: no CSV in DATA_DIR
         sym_csv = os.path.join(DATA_DIR, f"{symbol}.csv")
         is_new_symbol = not os.path.exists(sym_csv)
 
-        # Only fetch oldest_date from API if:
-        # - it's the first day of a quarter (refresh all), OR
-        # - this is a new symbol with no existing CSV (bootstrap), OR
-        # - oldest_date is missing and there is no CSV yet
-        need_api = is_quarter_start or is_new_symbol or (pd.isna(state.loc[symbol, 'oldest_date']) and is_new_symbol)
+        # Fetch oldest_date only if:
+        # - quarter start (global refresh), OR
+        # - oldest_date not yet cached (regardless of CSV presence)
+        # Avoid refetching solely because symbol is new if we've already cached oldest_date in state.
+        oldest_cached = pd.notna(state.loc[symbol, 'oldest_date'])
+        need_api = is_quarter_start or (not oldest_cached)
+
+        # Optional: throttle re-fetches using oldest_fetched_at (e.g., skip if fetched today)
+        if need_api and pd.notna(state.loc[symbol, 'oldest_fetched_at']):
+            last_fetch_age_days = (today_ny.normalize() - state.loc[symbol, 'oldest_fetched_at'].normalize()).days
+            if last_fetch_age_days < 1 and not is_quarter_start and oldest_cached:
+                need_api = False  # already fetched recently
 
         if need_api:
             try:
                 api_oldest_ts = fetch_oldest_bar_date(symbol)
                 if pd.notna(api_oldest_ts):
                     state.loc[symbol, 'oldest_date'] = api_oldest_ts.tz_convert(NY_TZ).normalize()
+                state.loc[symbol, 'oldest_fetched_at'] = today_ny
                 print(f"[INFO] Oldest date for {symbol}: {state.loc[symbol, 'oldest_date']}")
                 oldestDateAPICallCounter += 1
                 if oldestDateAPICallCounter % 100 == 0:
@@ -616,13 +815,10 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
                 
 
 
-    # Save state atomically
+    # Save state atomically only after modifications to oldest_date bootstrap; avoid redundant writes
     tmp = STATE_FILE + ".tmp"
-    state.to_csv(tmp)
-    state.to_csv(STATE_FILE)
-
-    # Ensure state is in ABC order before starting fetch loop
     state = state.sort_index()
+    state.to_csv(tmp)
     state.to_csv(STATE_FILE)
 
     symbols_remaining = set(state.index[state['complete'] == False])
@@ -634,6 +830,13 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
             state.loc[symbol, 'oldest_date'] = fixed_cutoff
         else:
             state.loc[symbol, 'oldest_date'] = max(state.loc[symbol, 'oldest_date'], fixed_cutoff)
+
+    # Reconcile state with existing CSVs before fetching (CSV is source of truth)
+    state = sync_state_from_csvs(state, DATA_DIR, symbols)
+    # Persist after sync
+    tmp = STATE_FILE + ".tmp"
+    state.to_csv(tmp)
+    state.to_csv(STATE_FILE)
 
     while symbols_remaining:
         # Iterate in alphabetical order for determinism

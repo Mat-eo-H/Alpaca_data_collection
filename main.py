@@ -1,4 +1,4 @@
-from app.alpaca_client import connect_trading, get_recent_bars, get_tradeable_symbols_df, download_all_symbols, repair_symbol_gaps
+from app.alpaca_client import connect_trading, get_recent_bars, get_tradeable_symbols_df, download_all_symbols, repair_symbol_gaps, ensure_aapl_forward_fill
 from app.data_handler import DataHandler
 
 # from app.data_handler.py import get_available_symbols
@@ -16,6 +16,9 @@ def main():
         print(bar)
     print("✅ Recent bars fetched", len(bars["AAPL"]), "This confirms API_KEY and API_SECRET are valid and connected to Alpaca")
 
+
+    # Ensure AAPL mask up-to-date for trading day filtering
+    ensure_aapl_forward_fill()
 
     # Get tradeable symbols
     symbols_df = get_tradeable_symbols_df(trading_client=trading_client)
