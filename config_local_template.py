@@ -8,3 +8,4 @@ RETRY_DELAY = 10  # seconds between retries
 CHUNK_DAYS = 90  # The number of days to get per symbol per loop, the code starts with most recent data, gets this number of days,
                  # when finished with all symbols, it will loop again with the next chunk of days
 NY_TZ = "America/New_York"  # Timezone for New York
+RESYNC_STATE_FROM_CSVS = False

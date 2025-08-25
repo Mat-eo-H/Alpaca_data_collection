@@ -26,7 +26,7 @@ import pandas as pd
 import pytz
 import colorama
 from typing import Optional
-from config_local import API_KEY, API_SECRET, BASE_URL, BASE_DATA_DIR, MAX_RETRIES, RETRY_DELAY, CHUNK_DAYS, NY_TZ
+from config_local import API_KEY, API_SECRET, BASE_URL, BASE_DATA_DIR, MAX_RETRIES, RETRY_DELAY, CHUNK_DAYS, NY_TZ, RESYNC_STATE_FROM_CSVS
 from app.utils import ensure_tz_aware
 from app.data_handler import save_bars_to_csv
 
@@ -794,7 +794,8 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
 
         # Optional: throttle re-fetches using oldest_fetched_at (e.g., skip if fetched today)
         if need_api and pd.notna(state.loc[symbol, 'oldest_fetched_at']):
-            last_fetch_age_days = (today_ny.normalize() - state.loc[symbol, 'oldest_fetched_at'].normalize()).days
+            oldest_fetched_at = pd.to_datetime(state.loc[symbol, 'oldest_fetched_at'])
+            last_fetch_age_days = (today_ny.normalize() - oldest_fetched_at.normalize()).days
             if last_fetch_age_days < 1 and not is_quarter_start and oldest_cached:
                 need_api = False  # already fetched recently
 
@@ -832,11 +833,13 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
             state.loc[symbol, 'oldest_date'] = max(state.loc[symbol, 'oldest_date'], fixed_cutoff)
 
     # Reconcile state with existing CSVs before fetching (CSV is source of truth)
-    state = sync_state_from_csvs(state, DATA_DIR, symbols)
-    # Persist after sync
-    tmp = STATE_FILE + ".tmp"
-    state.to_csv(tmp)
-    state.to_csv(STATE_FILE)
+    if RESYNC_STATE_FROM_CSVS:
+        
+        state = sync_state_from_csvs(state, DATA_DIR, symbols)
+        # Persist after sync
+        tmp = STATE_FILE + ".tmp"
+        state.to_csv(tmp)
+        state.to_csv(STATE_FILE)
 
     while symbols_remaining:
         # Iterate in alphabetical order for determinism
