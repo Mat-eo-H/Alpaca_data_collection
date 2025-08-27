@@ -1,4 +1,4 @@
-from app.alpaca_client import connect_trading, get_recent_bars, get_tradeable_symbols_df, download_all_symbols, repair_symbol_gaps, ensure_aapl_forward_fill
+from app.alpaca_client import connect_trading, get_recent_bars, get_tradeable_symbols_df, download_all_symbols, repair_symbol_gaps, ensure_aapl_forward_fill, cleanup_state_timestamps
 from app.data_handler import DataHandler
 
 # from app.data_handler.py import get_available_symbols
@@ -36,6 +36,7 @@ def main():
 
     # COMMENTED OUT, but this is a function that will try to find data gaps in your CSVs and fill them.  Remove the comment if you think you may have gaps in your data
     # repair_symbol_gaps(trading_client=trading_client, symbols_df=symbols_df)
+    
 
     download_all_symbols(trading_client=account, symbols_df=symbols_df)
 
