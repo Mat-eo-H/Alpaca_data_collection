@@ -407,4 +407,4 @@ def save_bars_to_csv(df, symbol, data_dir):
     df = df.sort_values('timestamp').reset_index(drop=True)
 
     df.to_csv(file_path, index=False)
-    print(f"Saved {symbol} bars to {file_path}")
+    print(f"Saved {symbol} bars to {file_path} at {pd.Timestamp.now(tz=NY_TZ)}")
