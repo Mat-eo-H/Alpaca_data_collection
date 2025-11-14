@@ -26,9 +26,10 @@ import pandas as pd
 import pytz
 import colorama
 from typing import Optional
-from config_local import API_KEY, API_SECRET, BASE_URL, BASE_DATA_DIR, MAX_RETRIES, RETRY_DELAY, CHUNK_DAYS, NY_TZ, RESYNC_STATE_FROM_CSVS
+from config_local import API_KEY, API_SECRET, BASE_URL, BASE_DATA_DIR, MAX_RETRIES, RETRY_DELAY, CHUNK_DAYS, NY_TZ, RESYNC_STATE_FROM_CSVS, DAYS_B4_FORWARD_FILL, FIXED_CUTOFF_DATE
 from app.utils import ensure_tz_aware
 from app.data_handler import save_bars_to_csv
+from app.state_persistence import persist_state_dataframe
 
 
 _data_connected_once = False
@@ -36,6 +37,122 @@ _aapl_days_loaded = False
 _aapl_days: set = set()
 _aapl_earliest_day: Optional[pd.Timestamp] = None
 _aapl_latest_day: Optional[pd.Timestamp] = None
+
+
+def _resolve_feed_from_state(state: pd.DataFrame, symbol: str) -> tuple[str, Optional[object]]:
+    """Return the stored feed string and matching StockDataFeed enum (if available)."""
+    feed_str = ""
+    try:
+        val = state.loc[symbol, 'feed']
+        feed_str = "" if pd.isna(val) else str(val)
+    except Exception:
+        feed_str = ""
+
+    feed_enum = None
+    if StockDataFeed is not None:
+        upper = feed_str.upper()
+        if upper == 'IEX':
+            feed_enum = StockDataFeed.IEX
+        elif upper == 'SIP':
+            feed_enum = StockDataFeed.SIP
+
+    return feed_str, feed_enum
+
+
+def _forward_fill_symbol(state: pd.DataFrame, symbol: str, data_dir: str, now: pd.Timestamp) -> bool:
+    """Forward fill missing minutes up to "now" for a symbol. Returns True if state changed."""
+    if 'newest_timestamp' not in state.columns and 'newest_date' not in state.columns:
+        return False
+
+    try:
+        newest_ts = state.loc[symbol, 'newest_timestamp']
+    except KeyError:
+        return False
+
+    if pd.isna(newest_ts):
+        # Fallback: attempt to use date column if timestamp missing
+        if 'newest_date' in state.columns:
+            fallback_date = state.loc[symbol, 'newest_date']
+            if pd.notna(fallback_date):
+                parsed = pd.to_datetime(fallback_date, errors='coerce')
+                if pd.isna(parsed):
+                    return False
+                if parsed.tzinfo is None:
+                    parsed = parsed.tz_localize(NY_TZ)
+                else:
+                    parsed = parsed.tz_convert(NY_TZ)
+                newest_ts = parsed
+                state.loc[symbol, 'newest_timestamp'] = newest_ts
+                state.loc[symbol, 'newest_date'] = newest_ts.normalize() if 'newest_date' in state.columns else pd.NaT
+            else:
+                return False
+        else:
+            return False
+
+    if pd.isna(newest_ts):
+        return False
+
+    yesterday_ny = now.normalize()
+    latest_required = (yesterday_ny + pd.Timedelta(days=1)) - pd.Timedelta(minutes=1)
+    if newest_ts >= latest_required:
+        latest_day = newest_ts.tz_convert(NY_TZ).date() if newest_ts.tzinfo else newest_ts.date()
+        print(colorama.Fore.GREEN + f"[FWD] {symbol} already up-to-date through {latest_day}" + colorama.Style.RESET_ALL)
+        return False
+
+    ff_start = newest_ts + pd.Timedelta(minutes=1)
+    ff_latest_allowed = latest_required
+    ff_chunk_cap = ff_start + pd.Timedelta(days=CHUNK_DAYS)
+    ff_end = min(ff_chunk_cap, ff_latest_allowed)
+    if ff_start > ff_end:
+        return False
+
+    feed_str, feed_enum = _resolve_feed_from_state(state, symbol)
+
+    try:
+        print(colorama.Fore.BLUE + f"[FWD] {symbol} forward fill {ff_start.date()} -> {ff_end.date()}" + colorama.Style.RESET_ALL)
+        ff_df, ff_meta = fetch_1min_bars(symbol, start=ff_start, end=ff_end, feed=feed_enum)
+    except Exception as exc:  # pragma: no cover - defensive logging around network
+        print(colorama.Fore.RED + f"[FWD] {symbol} forward fill error: {exc}" + colorama.Style.RESET_ALL)
+        return False
+
+    if ff_df is None or ff_df.empty:
+        # Treat as no new trades; still advance newest_date so we do not refetch the same range next run.
+        try:
+            state.loc[symbol, 'newest_timestamp'] = max(newest_ts, ff_end)
+            if 'newest_date' in state.columns:
+                state.loc[symbol, 'newest_date'] = state.loc[symbol, 'newest_timestamp'].normalize()
+            print(colorama.Fore.YELLOW + f"[FWD] {symbol} forward fill {ff_start.date()} -> {ff_end.date()} returned 0 bars; advancing newest_date." + colorama.Style.RESET_ALL)
+        except Exception:
+            return False
+        return True
+
+    save_bars_to_csv(ff_df, symbol, data_dir)
+
+    if isinstance(ff_df.index, pd.MultiIndex):
+        ts_index = ff_df.index.get_level_values('timestamp') if 'timestamp' in ff_df.index.names else ff_df.index.get_level_values(-1)
+    else:
+        ts_index = ff_df.index
+
+    ts_index = pd.DatetimeIndex(ts_index).tz_convert(NY_TZ)
+    latest_trade_ts = ts_index.max()
+    state.loc[symbol, 'newest_timestamp'] = max(newest_ts, latest_trade_ts)
+    if 'newest_date' in state.columns:
+        state.loc[symbol, 'newest_date'] = state.loc[symbol, 'newest_timestamp'].normalize()
+
+    latest_meta = ff_meta.get('latest') if isinstance(ff_meta, dict) else None
+    if latest_meta is not None and pd.notna(latest_meta):
+        try:
+            latest_meta_ts = latest_meta.tz_convert(NY_TZ)
+            if latest_meta_ts > state.loc[symbol, 'newest_timestamp']:
+                state.loc[symbol, 'newest_timestamp'] = latest_meta_ts
+                if 'newest_date' in state.columns:
+                    state.loc[symbol, 'newest_date'] = state.loc[symbol, 'newest_timestamp'].normalize()
+        except Exception:
+            pass
+
+    latest_day_display = state.loc[symbol, 'newest_timestamp'].tz_convert(NY_TZ).date()
+    print(colorama.Fore.GREEN + f"[FWD] {symbol} up-to-date through {latest_day_display}" + colorama.Style.RESET_ALL)
+    return True
 
 def _parse_csv_times(df: pd.DataFrame) -> pd.Series:
     """Return tz-aware (NY) pandas Series of timestamps from a bars CSV.
@@ -322,14 +439,15 @@ def sync_state_from_csvs(state: pd.DataFrame, data_dir: str, symbols: list[str])
                 continue
             # Clean: drop duplicate date+time (or timestamp) and sort
             cleaned = False
-            if 'date' in df.columns and 'time' in df.columns:
-                before = len(df)
-                df = df.drop_duplicates(subset=['date','time']).sort_values(['date','time'])
-                if len(df) != before:
-                    cleaned = True
-            elif 'timestamp' in df.columns:
+            if 'timestamp' in df.columns:
                 before = len(df)
                 df = df.drop_duplicates(subset=['timestamp']).sort_values(['timestamp'])
+                if len(df) != before:
+                    cleaned = True
+            elif 'date' in df.columns and 'time' in df.columns:
+                # Fallback to date/time if no timestamp column
+                before = len(df)
+                df = df.drop_duplicates(subset=['date','time']).sort_values(['date','time'])
                 if len(df) != before:
                     cleaned = True
             if cleaned:
@@ -346,15 +464,23 @@ def sync_state_from_csvs(state: pd.DataFrame, data_dir: str, symbols: list[str])
             latest_ts = ts.max()
             earliest_day = earliest_ts.normalize()
             latest_day = latest_ts.normalize()
+            current_oldest_ts = state.loc[sym, 'oldest_timestamp'] if 'oldest_timestamp' in state.columns else pd.NaT
+            if pd.isna(current_oldest_ts) or earliest_ts < current_oldest_ts:
+                state.loc[sym, 'oldest_timestamp'] = earliest_ts
             # Update oldest_date
             if pd.isna(state.loc[sym, 'oldest_date']) or earliest_day < state.loc[sym, 'oldest_date']:
                 state.loc[sym, 'oldest_date'] = earliest_day
                 updated_oldest += 1
+            current_newest_ts = state.loc[sym, 'newest_timestamp'] if 'newest_timestamp' in state.columns else pd.NaT
+            if pd.isna(current_newest_ts) or latest_ts > current_newest_ts:
+                state.loc[sym, 'newest_timestamp'] = latest_ts
             # Update newest_date
             if 'newest_date' in state.columns:
                 if pd.isna(state.loc[sym, 'newest_date']) or latest_day > state.loc[sym, 'newest_date']:
                     state.loc[sym, 'newest_date'] = latest_day
                     updated_newest += 1
+            else:
+                state.loc[sym, 'newest_timestamp'] = latest_ts
             # Initialize last_end if NaT so we don't refetch already covered range
             if pd.isna(state.loc[sym, 'last_end']):
                 # Set last_end to earliest_ts so algorithm will detect completion if oldest_date equals this day
@@ -362,6 +488,16 @@ def sync_state_from_csvs(state: pd.DataFrame, data_dir: str, symbols: list[str])
                 initialized_last_end += 1
         except Exception as e_sym_sync:
             print(colorama.Fore.YELLOW + f"[SYNC] Skipped {sym} due to error: {e_sym_sync}" + colorama.Style.RESET_ALL)
+    if 'oldest_timestamp' in state.columns:
+        state['oldest_timestamp'] = (
+            pd.to_datetime(state['oldest_timestamp'], errors='coerce', utc=True).dt.tz_convert(NY_TZ)
+        )
+        state['oldest_date'] = state['oldest_timestamp'].dt.normalize()
+    if 'newest_timestamp' in state.columns:
+        state['newest_timestamp'] = (
+            pd.to_datetime(state['newest_timestamp'], errors='coerce', utc=True).dt.tz_convert(NY_TZ)
+        )
+        state['newest_date'] = state['newest_timestamp'].dt.normalize()
     print(colorama.Fore.CYAN + f"[SYNC] State reconciled with CSVs: oldest_date updates={updated_oldest}, newest_date updates={updated_newest}, initialized last_end={initialized_last_end}." + colorama.Style.RESET_ALL)
     return state
 
@@ -526,7 +662,7 @@ def fetch_1min_bars(symbol, start: datetime, end: datetime, feed=None, limit=100
     pages = 0
     saw_full_page_without_token = False
     current_start = start
-    APIrequestDaysSize = 30  # max days per individual request (loops)
+    APIrequestDaysSize = 10  # max days per individual request (loops)
 
     while current_start < end:
         current_end = min(current_start + timedelta(days=APIrequestDaysSize), end)
@@ -606,8 +742,34 @@ def fetch_1min_bars(symbol, start: datetime, end: datetime, feed=None, limit=100
         # Simplified truncation: only consider edge coverage or pagination heuristic
         truncated = bool(saw_full_page_without_token or coverage_gap)
         meta = {"truncated": truncated, "earliest": earliest, "latest": latest, "pages": pages, "count": int(total_rows)}
+
+        try:
+            if pd.notna(earliest) and pd.notna(latest):
+                days_covered = max(0.0, (latest - earliest).total_seconds() / 86400.0)
+                print(
+                    colorama.Fore.YELLOW
+                    + f"[BARS] {symbol} received {total_rows} bars; first={earliest}; last={latest}; days={days_covered:.2f}"
+                    + colorama.Style.RESET_ALL
+                )
+            else:
+                print(
+                    colorama.Fore.YELLOW
+                    + f"[BARS] {symbol} received {total_rows} bars; first/last timestamps unavailable."
+                    + colorama.Style.RESET_ALL
+                )
+        except Exception:
+            print(
+                colorama.Fore.YELLOW
+                + f"[BARS] {symbol} received {total_rows} bars; coverage summary unavailable."
+                + colorama.Style.RESET_ALL
+            )
         return full_df, meta
     # No bars accumulated
+    print(
+        colorama.Fore.YELLOW
+        + f"[BARS] {symbol} received 0 bars; window {start} -> {end}."
+        + colorama.Style.RESET_ALL
+    )
     return pd.DataFrame(), {"truncated": False, "earliest": pd.NaT, "latest": pd.NaT, "pages": 0, "count": 0}
 
 def _get_symbol_data_span_days(data_dir: str, symbol: str) -> float:
@@ -737,18 +899,11 @@ def cleanup_state_timestamps():
     shutil.copy2(STATE_FILE, backup_file)
     print(f"[CLEANUP] Backup created: {backup_file}")
     
-    # Save cleaned file
-    tmp_file = STATE_FILE + ".tmp"
-    state.to_csv(tmp_file)
-    
-    # Atomic replacement
-    if os.path.exists(tmp_file):
-        if os.path.exists(STATE_FILE):
-            os.remove(STATE_FILE)
-        os.rename(tmp_file, STATE_FILE)
+    try:
+        persist_state_dataframe(state, STATE_FILE)
         print(f"[CLEANUP] ✅ State file cleaned successfully!")
-    else:
-        print(f"[CLEANUP] ❌ Failed to create temporary file")
+    except Exception as cleanup_err:
+        print(f"[CLEANUP] ❌ Failed to persist cleaned state: {cleanup_err}")
 
 def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
     """Main orchestration: backfill 1-minute bars for all symbols moving backward in CHUNK_DAYS windows.
@@ -757,7 +912,9 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
         last_end          : Backward cursor (NY tz). Next fetch window ends at last_end (exclusive). After each successful
                                                 chunk we set last_end = earliest_chunk_timestamp - 1 minute. If NaT → start from 'now-1d'.
         oldest_date       : Target earliest trading day boundary (API seeded earliest daily bar, but clipped by fixed cutoff 2022-01-01).
-        newest_date       : Newest trading day (normalized date) we have written for the symbol (used for optional forward fill to yesterday).
+        oldest_timestamp  : Minute-level floor for backward fetching. Mirrors oldest_date but retains intra-day precision when available.
+        newest_timestamp  : Latest bar timestamp (NY tz) written for the symbol. Drives forward fill minute-level resume.
+        newest_date       : Normalized day mirror of newest_timestamp (backward compatibility, reporting, and coarse comparisons).
         complete          : True once last_end has reached/crossed oldest_date OR single-bar heuristic or error heuristics mark completion.
         feed              : Chosen data feed ('SIP' or 'IEX'). Set after first successful fetch; used to lock consistency.
         oldest_fetched_at : When we last asked the API for earliest daily bar (to avoid re-querying every run). Not a data boundary
@@ -784,21 +941,30 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
         else:
             state['last_end'] = pd.NaT
 
-        # oldest_date normalize
-        if 'oldest_date' in state.columns:
-            state['oldest_date'] = pd.to_datetime(state['oldest_date'], errors='coerce', utc=True).dt.tz_convert(NY_TZ)
+        # Oldest coverage timestamp (minute resolution) and normalized date mirror
+        if 'oldest_timestamp' in state.columns:
+            state['oldest_timestamp'] = pd.to_datetime(state['oldest_timestamp'], errors='coerce', utc=True).dt.tz_convert(NY_TZ)
         else:
-            state['oldest_date'] = pd.Series(pd.NaT, dtype="datetime64[ns, America/New_York]")
+            state['oldest_timestamp'] = pd.Series(pd.NaT, index=state.index, dtype="datetime64[ns, America/New_York]")
+
+        if 'oldest_date' in state.columns:
+            parsed_oldest = pd.to_datetime(state['oldest_date'], errors='coerce', utc=True).dt.tz_convert(NY_TZ)
+            state['oldest_timestamp'] = state['oldest_timestamp'].fillna(parsed_oldest)
+        state['oldest_date'] = state['oldest_timestamp'].dt.normalize()
 
         # complete fallback only if missing
         if 'complete' not in state.columns:
             state['complete'] = False
 
-        # newest_date fallback (preserve existing)
-        if 'newest_date' in state.columns:
-            state['newest_date'] = pd.to_datetime(state['newest_date'], errors='coerce', utc=True).dt.tz_convert(NY_TZ).dt.normalize()
+        # newest timestamp (minute resolution) and normalized date mirror
+        if 'newest_timestamp' in state.columns:
+            state['newest_timestamp'] = pd.to_datetime(state['newest_timestamp'], errors='coerce', utc=True).dt.tz_convert(NY_TZ)
         else:
-            state['newest_date'] = pd.NaT
+            state['newest_timestamp'] = pd.Series(pd.NaT, index=state.index, dtype="datetime64[ns, America/New_York]")
+        if 'newest_date' in state.columns:
+            parsed_newest = pd.to_datetime(state['newest_date'], errors='coerce', utc=True).dt.tz_convert(NY_TZ)
+            state['newest_timestamp'] = state['newest_timestamp'].fillna(parsed_newest)
+        state['newest_date'] = state['newest_timestamp'].dt.normalize()
 
         try:
             completed_count = int(state['complete'].sum()) if 'complete' in state.columns else 0
@@ -808,10 +974,6 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
     else:
         # fresh state
         state = pd.DataFrame(index=symbols_df['symbol'].tolist())
-        state['last_end'] = pd.NaT
-        state['oldest_date'] = pd.NaT
-        state['complete'] = False
-        state['newest_date'] = pd.NaT
 
     # --- normalize and align state with symbols_df ---
 
@@ -836,18 +998,33 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
         )
 
     # 3) ensure required columns exist
-    for col, default in [('last_end', pd.NaT), ('oldest_date', pd.NaT), ('complete', False), ('feed', ''), ('newest_date', pd.NaT)]:
+    column_defaults = [
+        ('last_end', pd.NaT),
+        ('oldest_timestamp', pd.NaT),
+        ('oldest_date', pd.NaT),
+        ('complete', False),
+        ('feed', ''),
+        ('newest_timestamp', pd.NaT),
+        ('newest_date', pd.NaT),
+    ]
+    datetime_cols = {'last_end', 'oldest_timestamp', 'oldest_date', 'newest_timestamp', 'newest_date'}
+    for col, default in column_defaults:
         if col not in state.columns:
-            state[col] = default
+            if col in datetime_cols:
+                state[col] = pd.Series(pd.NaT, index=state.index, dtype="datetime64[ns, America/New_York]")
+            else:
+                state[col] = default
 
     # 4) add missing symbols to state with defaults
     missing = [s for s in symbols if s not in state.index]
     if missing:
         new_rows = pd.DataFrame({
             'last_end': pd.NaT,
+            'oldest_timestamp': pd.NaT,
             'oldest_date': pd.NaT,
             'complete': False,
             'feed': '',
+            'newest_timestamp': pd.NaT,
             'newest_date': pd.NaT
         }, index=pd.Index(missing, name='symbol'))
         state = pd.concat([state, new_rows], axis=0)
@@ -857,12 +1034,7 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
 
     # 6) persist immediately only if brand new state (i.e., file did not exist before)
     if not os.path.exists(STATE_FILE):
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w", newline="", encoding="utf-8") as f:
-            state.to_csv(f)
-            f.flush()
-            os.fsync(f.fileno())
-        state.to_csv(STATE_FILE)
+        persist_state_dataframe(state, STATE_FILE)
         
 
     # --- Safeguard (one-time per run): if last_end already at/past oldest_date mark complete early.
@@ -876,9 +1048,7 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
                 early_completes += 1
         if early_completes:
             print(f"[STATE] Pre-marked {early_completes} symbol(s) complete based on last_end <= oldest_date.")
-            tmp = STATE_FILE + ".tmp"
-            state.to_csv(tmp)
-            state.to_csv(STATE_FILE)
+            persist_state_dataframe(state, STATE_FILE)
     except Exception as _safeguard_e:
         print(f"[WARN] last_end completion safeguard failed: {_safeguard_e}")
 
@@ -894,7 +1064,16 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
     for symbol in symbols:  # normalized list
         # Ensure row exists
         if symbol not in state.index:
-            state.loc[symbol, ['last_end', 'oldest_date', 'complete', 'feed', 'newest_date', 'oldest_fetched_at']] = [pd.NaT, pd.NaT, False, '', pd.NaT, pd.NaT]
+            state.loc[symbol, [
+                'last_end',
+                'oldest_timestamp',
+                'oldest_date',
+                'complete',
+                'feed',
+                'newest_timestamp',
+                'newest_date',
+                'oldest_fetched_at'
+            ]] = [pd.NaT, pd.NaT, pd.NaT, False, '', pd.NaT, pd.NaT, pd.NaT]
 
         # Determine if symbol is "new" to the database: no CSV in DATA_DIR (might be useful for other heuristics)
         sym_csv = os.path.join(DATA_DIR, f"{symbol}.csv")
@@ -918,13 +1097,15 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
             try:
                 api_oldest_ts = fetch_oldest_bar_date(symbol)
                 if pd.notna(api_oldest_ts):
-                    state.loc[symbol, 'oldest_date'] = api_oldest_ts.tz_convert(NY_TZ).normalize()
+                    localized_oldest = api_oldest_ts.tz_convert(NY_TZ)
+                    state.loc[symbol, 'oldest_timestamp'] = localized_oldest
+                    state.loc[symbol, 'oldest_date'] = localized_oldest.normalize()
                 state.loc[symbol, 'oldest_fetched_at'] = today_ny
                 print(f"[INFO] Oldest date for {symbol}: {state.loc[symbol, 'oldest_date']}")
                 oldestDateAPICallCounter += 1
                 if oldestDateAPICallCounter % 100 == 0:
                     print(f"[INFO] Fetched oldest date for {oldestDateAPICallCounter} symbols so far, updating STATE_FILE")
-                    state.to_csv(STATE_FILE)
+                    persist_state_dataframe(state, STATE_FILE)
             except Exception as e:
                 print(f"[WARN] Failed to fetch oldest date for {symbol}: {e}")
 
@@ -932,100 +1113,63 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
 
 
     # Save state atomically only after modifications to oldest_date bootstrap; avoid redundant writes
-    tmp = STATE_FILE + ".tmp"
     state = state.sort_index()
-    state.to_csv(tmp)
-    state.to_csv(STATE_FILE)
+    persist_state_dataframe(state, STATE_FILE)
+
+    now = pd.Timestamp.now(tz=NY_TZ) - timedelta(days=1)  # one-day buffer
+    
+    # Cap last_end to now to prevent fetching future data
+    if 'last_end' in state.columns:
+        state['last_end'] = state['last_end'].clip(upper=now)
+
+    # Forward fill newest data for all symbols before resuming backward backfill
+    forward_updates = 0
+    latest_required = (now.normalize() - pd.Timedelta(days=DAYS_B4_FORWARD_FILL)) - pd.Timedelta(minutes=1)  # yesterday's last minute
+    for sym in symbols:
+        # Pre-check state to skip API call if already up-to-date
+        newest_ts = state.loc[sym, 'newest_timestamp']
+        if pd.notna(newest_ts) and newest_ts >= latest_required:
+            print(colorama.Fore.GREEN + f"[FWD] {sym} already up-to-date through {newest_ts.date()}" + colorama.Style.RESET_ALL)
+            continue
+        try:
+            if _forward_fill_symbol(state, sym, DATA_DIR, now):
+                persist_state_dataframe(state, STATE_FILE)
+                forward_updates += 1
+        except Exception as _ff_pass_err:
+            print(colorama.Fore.RED + f"[FWD] {sym} forward fill error: {_ff_pass_err}" + colorama.Style.RESET_ALL)
+
+    if forward_updates:
+        persist_state_dataframe(state, STATE_FILE)
+        print(colorama.Fore.CYAN + f"[FWD] Completed forward fill for {forward_updates} symbol(s)." + colorama.Style.RESET_ALL)
 
     symbols_remaining = set(state.index[state['complete'] == False])
-    now = pd.Timestamp.now(tz=NY_TZ) - timedelta(days=1)  # one-day buffer
 
-    fixed_cutoff = pd.Timestamp("2022-01-01", tz=NY_TZ).normalize()
+    fixed_cutoff = pd.Timestamp(FIXED_CUTOFF_DATE, tz=NY_TZ).normalize()
     for symbol in symbols:
         if pd.isna(state.loc[symbol, 'oldest_date']):
             state.loc[symbol, 'oldest_date'] = fixed_cutoff
         else:
             state.loc[symbol, 'oldest_date'] = max(state.loc[symbol, 'oldest_date'], fixed_cutoff)
+        state.loc[symbol, 'oldest_timestamp'] = state.loc[symbol, 'oldest_date']
+    persist_state_dataframe(state, STATE_FILE)
 
     # Reconcile state with existing CSVs before fetching (CSV is source of truth)
     if RESYNC_STATE_FROM_CSVS:
         
         state = sync_state_from_csvs(state, DATA_DIR, symbols)
         # Persist after sync
-        tmp = STATE_FILE + ".tmp"
-        state.to_csv(tmp)
-        state.to_csv(STATE_FILE)
-
-    # --- Mini sanity sync (lightweight) ---
-    # If we did NOT do a full sync (or even if we did, harmless), ensure that any symbol with:
-    #   - last_end still NaT
-    #   - an existing CSV on disk
-    #   - newest_date is older than (now - CHUNK_DAYS)
-    # gets its last_end initialized to the earliest timestamp in the CSV so we continue BACKWARD
-    # instead of refetching the newest window.
-    now_for_mini = pd.Timestamp.now(tz=NY_TZ)
-    stale_cutoff = (now_for_mini - pd.Timedelta(days=CHUNK_DAYS)).normalize()
-    mini_synced = 0
-    for sym in symbols:
-        try:
-            if pd.notna(state.loc[sym, 'last_end']):
-                continue  # already initialized
-            csv_path = os.path.join(DATA_DIR, f"{sym}.csv")
-            if not os.path.exists(csv_path):
-                continue  # nothing on disk
-            newest_date = state.loc[sym, 'newest_date'] if 'newest_date' in state.columns else pd.NaT
-            if pd.isna(newest_date) or newest_date >= stale_cutoff:
-                # If dataset already considered recent (or unknown), skip mini-sync; normal logic will fetch recent window
-                continue
-            # Lightweight parse: read only essential columns then derive earliest/latest
-            df = pd.read_csv(csv_path)
-            if df.empty:
-                continue
-            ts = _parse_csv_times(df)
-            if ts.empty:
-                continue
-            earliest_ts = ts.min()
-            latest_ts = ts.max()
-            # Initialize last_end to earliest_ts so backward fetch begins from that point
-            state.loc[sym, 'last_end'] = earliest_ts
-            # Ensure oldest_date / newest_date consistency
-            earliest_day = earliest_ts.normalize()
-            latest_day = latest_ts.normalize()
-            if pd.isna(state.loc[sym, 'oldest_date']) or earliest_day < state.loc[sym, 'oldest_date']:
-                state.loc[sym, 'oldest_date'] = earliest_day
-            if pd.isna(state.loc[sym, 'newest_date']) or latest_day > state.loc[sym, 'newest_date']:
-                state.loc[sym, 'newest_date'] = latest_day
-            mini_synced += 1
-        except Exception as _mini_e:
-            print(colorama.Fore.YELLOW + f"[MINI-SYNC] Skipped {sym} due to error: {_mini_e}" + colorama.Style.RESET_ALL)
-    if mini_synced:
-        print(colorama.Fore.CYAN + f"[MINI-SYNC] Initialized last_end for {mini_synced} stale symbol(s) from existing CSVs." + colorama.Style.RESET_ALL)
-        tmp = STATE_FILE + ".tmp"
-        state.to_csv(tmp)
-        state.to_csv(STATE_FILE)
+        persist_state_dataframe(state, STATE_FILE)
 
     while symbols_remaining:
         # Iterate in alphabetical order for determinism
         for symbol in sorted(list(symbols_remaining)):
             oldest_date = state.loc[symbol, 'oldest_date']
             last_end = state.loc[symbol, 'last_end']
-            feed_str = ''
-            try:
-                feed_str = str(state.loc[symbol, 'feed']) if not pd.isna(state.loc[symbol, 'feed']) else ''
-            except Exception:
-                feed_str = ''
-            # lock feed if set in state
-            chosen_feed = None
-            if StockDataFeed is not None:
-                if feed_str.upper() == 'IEX':
-                    chosen_feed = StockDataFeed.IEX
-                elif feed_str.upper() == 'SIP':
-                    chosen_feed = StockDataFeed.SIP
-                else:
-                    chosen_feed = None  # will default to SIP attempt first
+            feed_str, chosen_feed = _resolve_feed_from_state(state, symbol)
 
             # Determine end_date boundary (move backward)
             end_date = now if pd.isna(last_end) else last_end
+            end_date = end_date + timedelta(minutes= 1)  # exclusive boundary
 
             # Determine start_date = max(oldest_date, end_date - CHUNK_DAYS)
             start_date = end_date - timedelta(days=CHUNK_DAYS)
@@ -1036,32 +1180,6 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
             if pd.notna(oldest_date) and start_date >= end_date:
                 print(f"[DONE] {symbol} — all data fetched.")
                 state.loc[symbol, 'complete'] = True
-                # forward fill to yesterday if possible
-                try:
-                    yesterday_ny = (pd.Timestamp.now(tz=NY_TZ) - pd.Timedelta(days=1)).normalize()
-                    newest_date = state.loc[symbol, 'newest_date'] if 'newest_date' in state.columns else pd.NaT
-                    if pd.notna(newest_date) and newest_date < yesterday_ny:
-                        ff_start = newest_date + pd.Timedelta(days=1)
-                        ff_end = yesterday_ny + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-                        feed_enum = None
-                        if StockDataFeed is not None:
-                            if feed_str.upper() == 'IEX':
-                                feed_enum = StockDataFeed.IEX
-                            elif feed_str.upper() == 'SIP':
-                                feed_enum = StockDataFeed.SIP
-                        print(colorama.Fore.BLUE + f"[FWD] {symbol} forward fill {ff_start.date()} -> {yesterday_ny.date()}" + colorama.Style.RESET_ALL)
-                        ff_df, ff_meta = fetch_1min_bars(symbol, start=ff_start, end=ff_end, feed=feed_enum)
-                        if ff_df is not None and not ff_df.empty:
-                            save_bars_to_csv(ff_df, symbol, DATA_DIR)
-                            if isinstance(ff_df.index, pd.MultiIndex):
-                                ff_ts = ff_df.index.get_level_values('timestamp') if 'timestamp' in ff_df.index.names else ff_df.index.get_level_values(-1)
-                            else:
-                                ff_ts = ff_df.index
-                            ff_ts = pd.DatetimeIndex(ff_ts).tz_convert(NY_TZ)
-                            state.loc[symbol, 'newest_date'] = ff_ts.max().normalize()
-                            print(colorama.Fore.GREEN + f"[FWD] {symbol} up-to-date through {state.loc[symbol, 'newest_date'].date()}" + colorama.Style.RESET_ALL)
-                except Exception as e_ff_sym:
-                    print(colorama.Fore.RED + f"[FWD] {symbol} forward fill error: {e_ff_sym}" + colorama.Style.RESET_ALL)
                 symbols_remaining.remove(symbol)
                 continue
 
@@ -1074,64 +1192,27 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
                     bars_df, meta = fetch_1min_bars(symbol, start=start_date, end=end_date, feed=primary_feed)
 
                     if bars_df.empty:
-                        # Summarize fetch result even when empty
-                        print(f"[FETCH] {symbol} received 0 bars; oldest=N/A; days=0.00")
                         # Do not advance dates on empty; only mark complete if we're at or past the oldest boundary
                         if pd.notna(oldest_date) and (start_date <= oldest_date):
                             print(colorama.Fore.LIGHTCYAN_EX, f"[INFO] No more bars for {symbol}; marking complete.", colorama.Style.RESET_ALL)
                             state.loc[symbol, 'complete'] = True
-                            # forward fill attempt
-                            try:
-                                yesterday_ny = (pd.Timestamp.now(tz=NY_TZ) - pd.Timedelta(days=1)).normalize()
-                                newest_date = state.loc[symbol, 'newest_date'] if 'newest_date' in state.columns else pd.NaT
-                                if pd.notna(newest_date) and newest_date < yesterday_ny:
-                                    ff_start = newest_date + pd.Timedelta(days=1)
-                                    ff_end = yesterday_ny + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-                                    feed_enum = None
-                                    if StockDataFeed is not None:
-                                        if feed_str.upper() == 'IEX':
-                                            feed_enum = StockDataFeed.IEX
-                                        elif feed_str.upper() == 'SIP':
-                                            feed_enum = StockDataFeed.SIP
-                                    print(colorama.Fore.BLUE + f"[FWD] {symbol} forward fill {ff_start.date()} -> {yesterday_ny.date()}" + colorama.Style.RESET_ALL)
-                                    ff_df, ff_meta = fetch_1min_bars(symbol, start=ff_start, end=ff_end, feed=feed_enum)
-                                    if ff_df is not None and not ff_df.empty:
-                                        save_bars_to_csv(ff_df, symbol, DATA_DIR)
-                                        if isinstance(ff_df.index, pd.MultiIndex):
-                                            ff_ts = ff_df.index.get_level_values('timestamp') if 'timestamp' in ff_df.index.names else ff_df.index.get_level_values(-1)
-                                        else:
-                                            ff_ts = ff_df.index
-                                        ff_ts = pd.DatetimeIndex(ff_ts).tz_convert(NY_TZ)
-                                        state.loc[symbol, 'newest_date'] = ff_ts.max().normalize()
-                                        print(colorama.Fore.GREEN + f"[FWD] {symbol} up-to-date through {state.loc[symbol, 'newest_date'].date()}" + colorama.Style.RESET_ALL)
-                            except Exception as e_ff2:
-                                print(colorama.Fore.RED + f"[FWD] {symbol} forward fill error: {e_ff2}" + colorama.Style.RESET_ALL)
                             symbols_remaining.remove(symbol)
-                        # Persist state and continue
-                        tmp = STATE_FILE + ".tmp"
-                        state.to_csv(tmp)
-                        state.to_csv(STATE_FILE)
+                            # Persist state and continue
+                        persist_state_dataframe(state, STATE_FILE)
                         break
 
                     # Summarize fetch result when we have data
-                    try:
-                        count = int(meta.get('count', len(bars_df)))
-                        earliest = meta.get('earliest')
-                        latest = meta.get('latest')
-                        if pd.notna(earliest) and pd.notna(latest):
-                            days_covered = max(0.0, (latest - earliest).total_seconds() / 86400.0)
+                    count = int(meta.get('count', len(bars_df)))
+                    earliest = meta.get('earliest')
+                    latest = meta.get('latest')
+                    if pd.isna(earliest) or pd.isna(latest):
+                        # Fallback compute from DataFrame if meta missing
+                        if isinstance(bars_df.index, pd.MultiIndex):
+                            ts_idx = bars_df.index.get_level_values('timestamp') if 'timestamp' in bars_df.index.names else bars_df.index.get_level_values(-1)
                         else:
-                            # Fallback compute from DataFrame if meta missing
-                            if isinstance(bars_df.index, pd.MultiIndex):
-                                ts_idx = bars_df.index.get_level_values('timestamp') if 'timestamp' in bars_df.index.names else bars_df.index.get_level_values(-1)
-                            else:
-                                ts_idx = bars_df.index
-                            earliest = pd.to_datetime(ts_idx.min()).tz_convert(NY_TZ)
-                            latest = pd.to_datetime(ts_idx.max()).tz_convert(NY_TZ)
-                            days_covered = max(0.0, (latest - earliest).total_seconds() / 86400.0)
-                        print(f"[FETCH] {symbol} received {count} bars; oldest={earliest}; days={days_covered:.2f}")
-                    except Exception:
-                        print(f"[FETCH] {symbol} received {len(bars_df)} bars; oldest=unknown; days=unknown")
+                            ts_idx = bars_df.index
+                        earliest = pd.to_datetime(ts_idx.min()).tz_convert(NY_TZ)
+                        latest = pd.to_datetime(ts_idx.max()).tz_convert(NY_TZ)
 
                     save_bars_to_csv(bars_df, symbol, DATA_DIR)
 
@@ -1166,9 +1247,7 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
                             print(colorama.Fore.LIGHTCYAN_EX + f"[DONE-SINGLE] {symbol} single earliest bar reached boundary {boundary_day.date()} – marking complete." + colorama.Style.RESET_ALL)
                             symbols_remaining.remove(symbol)
                             # Persist state immediately
-                            tmp = STATE_FILE + ".tmp"
-                            state.to_csv(tmp)
-                            state.to_csv(STATE_FILE)
+                            persist_state_dataframe(state, STATE_FILE)
                             break  # exit retry loop for this symbol
                     except Exception as _single_bar_e:
                         print(colorama.Fore.YELLOW + f"[WARN] Single-bar completion logic issue for {symbol}: {_single_bar_e}" + colorama.Style.RESET_ALL)
@@ -1285,14 +1364,12 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
                             pass
 
                     # Save state atomically after each success
-                    tmp = STATE_FILE + ".tmp"
                     # Enforce minute precision before persisting
                     try:
                         state['last_end'] = state['last_end'].dt.floor('T')
                     except Exception:
                         pass
-                    state.to_csv(tmp)
-                    state.to_csv(STATE_FILE)
+                    persist_state_dataframe(state, STATE_FILE)
                     if completed_by_boundary_shift:
                         symbols_remaining.remove(symbol)
                     break
@@ -1311,9 +1388,7 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
                             print(colorama.Fore.YELLOW + f"[INFO] SIP failed for {symbol}, but >=3 months of data exists; not switching to IEX." + colorama.Style.RESET_ALL)
                             state.loc[symbol, 'complete'] = True
                             symbols_remaining.remove(symbol)
-                            tmp = STATE_FILE + ".tmp"
-                            state.to_csv(tmp)
-                            state.to_csv(STATE_FILE)
+                            persist_state_dataframe(state, STATE_FILE)
                             break
                         else:
                             # Try IEX; if it works, lock symbol to IEX and rebuild from beginning
@@ -1329,9 +1404,7 @@ def download_all_symbols(trading_client, symbols_df: pd.DataFrame):
                                     if os.path.exists(sym_csv):
                                         os.remove(sym_csv)
                                     print(colorama.Fore.CYAN + f"[SWITCH] Switching {symbol} to IEX and rebuilding entire dataset from beginning." + colorama.Style.RESET_ALL)
-                                    tmp = STATE_FILE + ".tmp"
-                                    state.to_csv(tmp)
-                                    state.to_csv(STATE_FILE)
+                                    persist_state_dataframe(state, STATE_FILE)
                                     # Break retry loop; next outer iteration will fetch using IEX
                                     break
                                 else:

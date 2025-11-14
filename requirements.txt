@@ -2,3 +2,4 @@
 # example:  pip install alpaca-py pandas numpy - enter a command line like this in the terminal
 alpaca-py
 pandas
+numpy

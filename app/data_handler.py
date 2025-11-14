@@ -398,8 +398,13 @@ def save_bars_to_csv(df, symbol, data_dir):
     # Append to existing CSV without duplicates
     if os.path.exists(file_path):
         existing_df = pd.read_csv(file_path)
-        df = pd.concat([existing_df, df])
-        df = df.drop_duplicates(subset=['date', 'time']).sort_values(['date', 'time'])
+        df = pd.concat([existing_df, df], ignore_index=True)
+        # Normalize timestamp to datetime for deduplication
+        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True).dt.tz_convert(NY_TZ)
+        df = df.drop_duplicates(subset=['timestamp'], keep='last')
+ 
+    # Sort by timestamp for chronological order
+    df = df.sort_values('timestamp').reset_index(drop=True)
 
     df.to_csv(file_path, index=False)
     print(f"Saved {symbol} bars to {file_path}")
