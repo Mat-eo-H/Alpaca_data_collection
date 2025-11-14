@@ -5,7 +5,8 @@ BASE_DATA_DIR = "c:/Users/YOUR_WINDOWS_USER/StockData"  # update to the file pat
                                                         # may be synced folders with OneDrive and cause issues
 MAX_RETRIES = 5
 RETRY_DELAY = 10  # seconds between retries
-CHUNK_DAYS = 90  # The number of days to get per symbol per loop, the code starts with most recent data, gets this number of days,
-                 # when finished with all symbols, it will loop again with the next chunk of days
+CHUNK_DAYS = 360  # days per data chunk request
 NY_TZ = "America/New_York"  # Timezone for New York
-RESYNC_STATE_FROM_CSVS = False
+RESYNC_STATE_FROM_CSVS = False  # Whether to resync state from existing CSV files on startup
+DAYS_B4_FORWARD_FILL = 5  # Number of days back before running forward fill (per symbol)
+FIXED_CUTOFF_DATE = "2022-01-01"  # Fixed cutoff date for historical data
