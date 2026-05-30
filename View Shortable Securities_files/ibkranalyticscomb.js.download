@@ -1,0 +1,174 @@
+function checkCookies() {
+  console.log('checkCookies');
+  var web_ls = sanitizeWebId(localStorage.getItem('web'));
+  if (web_ls != null) {
+    var dataObj = { 'web_ls': web_ls };
+    var endpoint = origin + '/mkt/ibkrwebcookie.php';
+    $.ajax({
+      type: 'POST',
+      url: endpoint,
+      data: JSON.stringify(dataObj),
+      dataType: 'json',
+      contentType: 'application/json',
+      //data: JSON.stringify(payload),
+      success: function (json_response) {
+        console.log("Success");
+        console.log(json_response);
+        var cookie_id = json_response.cookie_id;
+        console.log('Cookie id:' + cookie_id);
+      },
+      error: function (xhr, status, err) { console.log(err); }
+    });
+  }
+}
+function addCookies() {
+  console.log('addCookies');
+  var endpoint = origin + '/mkt/ibkrtracking.php';
+  $.ajax({
+    type: 'POST',
+    url: endpoint,
+    dataType: 'json',
+    contentType: 'application/json',
+    //data: JSON.stringify(payload),
+    success: function (json_response) {
+      console.log("Success");
+      console.log(json_response);
+      var cookie_id = json_response.cookie_id;
+      console.log('Cookie id:' + cookie_id);
+    },
+    error: function (xhr, status, err) { console.log(err); }
+  });
+}
+async function mapAnalytics() {
+  console.log('mapAnalytics');
+  var webCookie = await getWebCookieUrl();
+  var web_ls = sanitizeWebId(localStorage.getItem('web'));
+  if (webCookie == null) {
+    webCookie = addCookies();
+  }
+  if (webCookie !== null) {
+    if (web_ls != null && web_ls != webCookie) {
+      //localStorage.setItem('web', webCookie);
+      $.ajax({
+        type: 'POST',
+        url: '/webrest/trk/map',
+        dataType: 'json',
+        contentType: 'application/json',
+        data: JSON.stringify({ 'cookieId1': parseInt(webCookie), 'cookieId2': parseInt(web_ls), 'sourceId1': 'webCookie', 'sourceId2': 'localStorage' }),
+        success: function (r) {
+          console.log('Changed web.');
+          checkCookies();
+        },
+        error: function (xhr, status, err) { }
+      });
+    } else if (web_ls == null) { // Nothing in localStorage, add 
+      localStorage.setItem('web', webCookie);
+    }
+  } else if (isValidWebId(web_ls)) { // Unlikely to hit this 
+    webCookie = web_ls;
+    checkCookies();
+  }
+  addIBKRFingerprint(webCookie);
+}
+function addAnalytics() {
+  console.log('addAnalytics');
+
+  //var payload = { 'referrer': document.referrer };
+  // URL constructor polyfill may be needed for older browsers
+  var origin = window.location.origin || (window.location.protocol + '//' + window.location.hostname + (window.location.port ? ':' + window.location.port : ''));
+  var endpoint = origin + '/mkt/ibkranalytics.php';
+  $.ajax({
+    type: 'POST',
+    url: endpoint,
+    contentType: 'application/json',
+    dataType: 'json',
+    //data: JSON.stringify(payload),
+    success: function (json_response) {
+      console.log("Success");
+      console.log(json_response);
+      var cookie_id = json_response.cookie_id;
+      //console.log('Cookie id: ' + getWebCookieUrl());
+      if (isValidWebId(cookie_id)) {
+        localStorage.setItem('web', cookie_id);
+        addIBKRFingerprint(cookie_id);
+      }
+    },
+    error: function (xhr, status, err) { console.log(err); }
+  });
+}
+async function getWebCookieUrl() {
+  var endpoint = origin + '/response_handler/web/cookie.php';
+  const response = await fetch(endpoint);
+  const res = await response.json();
+  return res.web;
+}
+function addIBKRFingerprint(webCookie) {
+  var ibkrfp = new IBKRFingerprint(webCookie);
+  var components = ibkrfp.getComponents();
+  var payload = {
+    'browser': components['browser'],
+    'screen-size': components['screen-size'],
+    'timezone-offset': components['timezone-offset'],
+    'low-fp': ibkrfp.lowEntrophyFP,
+    'med-fp': ibkrfp.medEntrophyFP,
+    'high-fp': ibkrfp.highEntropyFP,
+    'plugins': components['plugins'],
+    'cookie-id': webCookie
+  };
+  if (components['mobile-device']) {
+    payload['is-mobile-device'] = components['mobile-device'];
+  }
+  var origin = window.location.origin || (window.location.protocol + '//' + window.location.hostname + (window.location.port ? ':' + window.location.port : ''));
+  var endpoint = origin + '/mkt/ibkrfingerprint.php';
+  // Send fingerprint 
+  $.ajax({
+    type: 'POST',
+    url: endpoint,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Client-Id': webCookie
+    },
+    dataType: "json",
+    data: JSON.stringify(payload),
+    success: function (r) {
+      console.log('Changed web.');
+    },
+    error: function (xhr, status, err) { }
+  });
+  //Naga added- save fp to database start
+  var endpoint1 = origin + '/mkt/saveMktFingerprint.php';
+  $.ajax({
+    type: 'POST',
+    url: endpoint1,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Client-Id': webCookie
+    },
+    dataType: "json",
+    data: JSON.stringify(payload),
+    success: function (r) {
+      console.log('saved naga tk fp.');
+    },
+    error: function (xhr, status, err) { }
+  });
+  //Naga added- save fp to database end
+}
+function sanitizeWebId(id) {
+  // Return null for undefined/null values
+  if (id === undefined || id === null || !isValidWebId(id)) {
+    return null;
+  }
+  // Ensure ID isn't unreasonably long
+  if (id.toString().length > 20) {
+    console.warn('ID exceeds maximum allowed length');
+    return null;
+  }
+  return id;
+}
+function isValidWebId(id) {
+  return id !== null && id !== undefined && /^\d+$/.test(String(id));
+}
+// Check if a value is numeric (helper function)
+function isNumeric(value) {
+  return !isNaN(parseFloat(value)) && isFinite(value);
+}

@@ -1,0 +1,675 @@
+var reg_dom;
+
+function getCC()
+{
+  var loc = '';
+  var r = '&ct=';
+  var d = window.location.hostname;
+  if (d.match('.com.hk')) loc = 'HK';
+  else if( d.match('.com.cn')) loc = 'HK';
+  else if( d.match('.co.jp')) loc = 'JP';
+  else if( d.match('.co.uk')) loc = 'UK';
+  else if( d.match('.co.in')) loc = 'IN';
+  else if( d.match('.com.au')) loc = 'AU';
+  else if( d.match('.ca')) loc = 'CA';
+  else if( d.match('.eu')) loc = 'EU';
+  else loc = 'US';
+  return r+loc;
+}
+function hasReferererWithExtendedChars(r)
+{
+  r = r ? decodeURI(r) : '';
+  var use_ga = false;
+  for (var i=0; i < r.length; i ++)
+  {
+    if (r.charCodeAt(i) > 31 && r.charCodeAt(i) < 127)
+    {
+      use_ga = true;
+      break;
+    }
+  }
+  return use_ga;
+}
+function submitWebSiteSearch()
+{
+ if (trim(document.search.q.value) == 'Type Website Search Text')
+ {
+     document.search.q.value = "";
+ }
+ document.search.submit();
+}
+/* Open a new window */
+function NewWindow(mypage, myname, w, h, pos, infocus)
+{
+  var win = null;
+  if (pos == "random") {
+      myleft = (screen.width) ? Math.floor(Math.random() * (screen.width-w)):100;
+      mytop = (screen.height) ? Math.floor(Math.random() * ((screen.height-h)-75)):100;
+  }
+  if (pos == "center") {
+      myleft = (screen.width) ? (screen.width-w) / 2:100;
+      mytop = (screen.height) ? (screen.height-h) / 2:100;
+  } else if ((pos !='center' && pos != "random") || pos == null) {
+      myleft = 0;mytop = 20
+  }
+  settings = "width=" + w + ", height=" + h + ",top=" + mytop + ",left=" + myleft + ", scrollbars=yes, location=no, directories=no, status=no, menubar=no, toolbar=no, resizable=yes";
+  win = window.open(mypage, myname, settings);
+  win.focus();
+}
+function NewWindowOptions(mypage, myname, w, h, pos, infocus, scroll, resize)
+{
+  var win = null;
+  if (pos == "random") {
+      myleft = (screen.width) ? Math.floor(Math.random() * (screen.width-w)):100;
+      mytop = (screen.height) ? Math.floor(Math.random() * ((screen.height-h)-75)):100;
+  }
+  if (pos == "center") {
+      myleft = (screen.width) ? (screen.width-w) / 2:100;
+      mytop = (screen.height) ? (screen.height-h) / 2:100;
+  } else if ((pos !='center' && pos != "random") || pos == null) {
+      myleft = 0;mytop = 20
+  }
+  settings = "width=" + w + ", height=" + h + ",top=" + mytop + ",left=" + myleft + ", scrollbars= "+scroll+", location=no, directories=no, status=no, menubar=no, toolbar=no, resizable="+resize;
+  win = window.open(mypage, myname, settings);
+  win.focus();
+}
+function openNewWindow(theURL,winName,features) //v2.0
+{
+  window.open(theURL,winName,features);
+}
+function trim(string)
+{
+  return(string.replace(/^\s+|\s+$/g,''));
+}
+function validName(name)
+{
+  ok = "qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM' ";
+  for(i=0;i < name.length; i++)
+  {
+    if(ok.indexOf(name.charAt(i)) < 0)
+    {
+     return false;
+    }
+  }
+  return true;
+}
+function validEmail(email)
+{
+  if(email.length < 7)
+  {
+   return false;
+  }
+  else
+  {
+    ok = "1234567890qwertyuiop[]asdfghjklzxcvbnm.@-_QWERTYUIOPASDFGHJKLZXCVBNM";
+    for(i=0;i < email.length; i++)
+    {
+      if(ok.indexOf(email.charAt(i)) < 0)
+      {
+       return false;
+      }
+    }
+  }
+  return true;
+}
+function validURL(url)
+{
+  if(url.length < 9)
+  {
+    return false;
+  }
+  else
+  {
+    ok = "1234567890qwertyuiopasdfghjklzxcvbnm.-_QWERTYUIOPASDFGHJKLZXCVBNM/~";
+    for(i=0;i < url.length; i++)
+    {
+      if(ok.indexOf(url.charAt(i)) < 0)
+        return false;
+    }
+  }
+  return true;
+}
+function stringContainsDigits(str, min)
+{
+  var ok = "1234567890";
+  var c = 0;
+  for(i=0;i < str.length; i++)
+  {
+    if(ok.indexOf(str.charAt(i)) != -1)
+    {
+      c ++;
+    }
+  }
+  if (c > min)
+  {
+    return true;
+  }
+  return false;
+}
+function isRadioSelected(r)
+{
+   for(i=0; i<r.length; i ++)
+   {
+       if (r[i].checked)
+       {
+           return true;
+       }
+   }
+   return false;
+}
+function eMailCheck(str) 
+{
+  var at="@";
+  var dot=".";
+  var lat=str.indexOf(at);
+  var lstr=str.length;
+  var ldot=str.indexOf(dot);
+  if (str.indexOf(at)==-1){
+   return false;
+  }
+  if (str.indexOf(at)==-1 || str.indexOf(at)==0 || str.indexOf(at)==lstr){
+   return false;
+  }
+  if (str.indexOf(dot)==-1 || str.indexOf(dot)==0 || str.indexOf(dot)==lstr){
+   return false;
+  }
+  if (str.indexOf(at,(lat+1))!=-1){
+   return false;
+  }
+  if (str.substring(lat-1,lat)==dot || str.substring(lat+1,lat+2)==dot){
+   return false;
+  }
+  if (str.indexOf(dot,(lat+2))==-1){
+   return false;
+  }
+  if (str.indexOf(" ")!=-1){
+   return false;
+  }
+  return true;				
+}
+function cookieIsEnabled(name, value, days)
+{
+  setCookie(name, value, days);
+  if (document.cookie.indexOf(name) != -1)
+  {
+    setCookie(name, value, 0);
+    return true;
+  }
+  return false;
+}
+function setCookie(name, value, days, domain)
+{
+  var v = name + "=" + value;
+  if (days){
+    var exp = new Date();
+    exp.setTime(exp.getTime() + (3600000*24*days));
+    v += ";expires="+exp.toGMTString();
+  }
+  v += ";path=/";
+  if (domain)
+  {
+    if (domain == '.') /* Root domain */
+    {
+      domain = location.hostname.replace(/.+(\.\w*b\w*\.\w*.{0,4})/, "$1");
+    }
+    v += ";domain="+domain;
+  }
+  document.cookie = v;
+}
+function hasCookie(name, value)
+{
+  if (value == getCookie(name))
+  {
+   return true;
+  }
+  return false;
+}
+function deleteCookie(name)
+{
+  setCookie(name,"1",0);
+}
+function getCookie(name) 
+{
+  var dc = document.cookie;
+  var prefix = name + "=";
+  var begin = dc.indexOf("; " + prefix);
+  if (begin == -1) {
+     begin = dc.indexOf(prefix);
+     if (begin != 0) return null;
+  } else {
+     begin += 2;
+  }
+  var end = document.cookie.indexOf(";", begin);
+  if (end == -1)
+      end = dc.length;
+  return unescape(dc.substring(begin + prefix.length, end)); 
+}
+function getEventXYCoordinates(e)
+{
+  if (isie){e = event;}
+  if (navigator.appName == "Microsoft Internet Explorer") {
+      y = (e.clientY + document.body.scrollTop);
+      x = e.clientX;
+  }
+  else {
+      y = e.pageY;
+      x = e.pageX;
+  }
+  return new Array(parseInt(x), parseInt(y));
+}
+function addOnloadEvent(fnc){
+  if ( typeof window.addEventListener != "undefined" )
+    window.addEventListener( "load", fnc, false );
+  else if ( typeof window.attachEvent != "undefined" ) {
+    window.attachEvent( "onload", fnc );
+  }
+  else {
+    if ( window.onload != null ) {
+      var oldOnload = window.onload;
+      window.onload = function ( e ) {
+        oldOnload( e );
+        window[fnc]();
+      };
+    }
+    else
+      window.onload = fnc;
+  }
+}
+var keyStr = "ABCDEFGHIJKLMNOP" +
+"QRSTUVWXYZabcdef" +
+"ghijklmnopqrstuv" +
+"wxyz0123456789+/" +
+"=";
+function encode64(input) {
+    input = escape(input);
+    var output = "";
+    var chr1, chr2, chr3 = "";
+    var enc1, enc2, enc3, enc4 = "";
+    var i = 0;
+    do {
+        chr1 = input.charCodeAt(i++);
+        chr2 = input.charCodeAt(i++);
+        chr3 = input.charCodeAt(i++);
+        enc1 = chr1 >> 2;
+        enc2 = ((chr1 & 3) << 4) | (chr2 >> 4);
+        enc3 = ((chr2 & 15) << 2) | (chr3 >> 6);
+        enc4 = chr3 & 63;
+        if (isNaN(chr2)) {
+            enc3 = enc4 = 64;
+        } else if (isNaN(chr3)) {
+            enc4 = 64;
+        }
+        output = output +
+        keyStr.charAt(enc1) +
+        keyStr.charAt(enc2) +
+        keyStr.charAt(enc3) +
+        keyStr.charAt(enc4);
+        chr1 = chr2 = chr3 = "";
+        enc1 = enc2 = enc3 = enc4 = "";
+    } while (i < input.length);
+    return output;
+}
+function decode64(input) {
+    var output = "";
+    var chr1, chr2, chr3 = "";
+    var enc1, enc2, enc3, enc4 = "";
+    var i = 0;
+    // remove all characters that are not A-Z, a-z, 0-9, +, /, or =
+    input = input.replace(/[^A-Za-z0-9\+\/\=]/g, "");
+    do {
+        enc1 = keyStr.indexOf(input.charAt(i++));
+        enc2 = keyStr.indexOf(input.charAt(i++));
+        enc3 = keyStr.indexOf(input.charAt(i++));
+        enc4 = keyStr.indexOf(input.charAt(i++));
+        chr1 = (enc1 << 2) | (enc2 >> 4);
+        chr2 = ((enc2 & 15) << 4) | (enc3 >> 2);
+        chr3 = ((enc3 & 3) << 6) | enc4;
+        output = output + String.fromCharCode(chr1);
+        if (enc3 != 64) {
+            output = output + String.fromCharCode(chr2);
+        }
+        if (enc4 != 64) {
+            output = output + String.fromCharCode(chr3);
+        }
+        chr1 = chr2 = chr3 = "";
+        enc1 = enc2 = enc3 = enc4 = "";
+    } while (i < input.length);
+    return unescape(output);
+}
+function getCookieValue(cookieParam){
+	var param = cookieParam + "=";
+	var cookie = decodeURIComponent(document.cookie).split(';');
+	for(var i = 0; i < cookie.length; i++){
+		if(cookie[i].indexOf(param) != -1){
+			return cookie[i].trim().substring(param.length, cookie[i].length);
+		}
+	}
+	return false;
+}
+//Changes <a> to formWelcome to landing page for google stats
+function changeA2LP() {
+    if (hasCookie('googlermkt', '1'))
+    {
+      return;
+    }
+    if (document.domain.match(/sports/))
+    {
+      return;
+    }
+    var a = document.getElementsByTagName("a");
+    var lang = getCookieValue("njwebconv_language");
+    var locale = '';
+    if(lang == "tc" && location.href.match(/\/cn\//)){
+      locale = "zh_TW";
+    } else if(lang == "cn" || location.href.match(/\/cn\//)) { 
+      locale = 'zh_CN'; 
+    } else if(lang == "fr" || location.href.match(/\/fr\//)) { 
+      locale = 'fr_FR'; 
+    } else if(lang == "de" || location.href.match(/\/de\//)) { 
+      locale = 'de_DE'; 
+    } else if(lang == "es" || location.href.match(/\/es\//)) { 
+      locale = 'es_ES'; 
+    } else if(lang == "ru" || location.href.match(/\/ru\//)) { 
+      locale = 'ru_RU'; 
+    } else if(lang == "it" || location.href.match(/\/it\//)) { 
+      locale = 'it_IT'; 
+    } else if(lang == "jp" || location.href.match(/\/jp\//)) { 
+      locale = 'ja_JP'; 
+    } else if(lang == "en" || location.href.match(/\/en\//) || !lang) { 
+      locale = 'en_US'; 
+    }
+    if (!document.domain.match(/(interactivebrokers|ibkr)\.com$|ibkr\.hk$/) || location.href.match(/\&prtnr=stkbrks/) || location.href.match(/\/cn\//))
+    {
+      for (var i = 0; i < a.length; i++) 
+      {	
+        if (a[i].href.indexOf('/Universal/servlet/formWelcome') != -1 || a[i].href.indexOf('/Universal/servlet/Application.ApplicationSelector') != -1 || a[i].href.indexOf('/Universal/Application') != -1 || a[i].href.indexOf('/sso/Login') != -1) {
+          if(a[i].href.indexOf('?') != -1){
+            a[i].href = a[i].href + "&locale="+locale;
+          } else {
+            a[i].href = a[i].href + "?locale="+locale;
+          }
+        } 
+      }
+      return;
+    }
+    var is_ib_hk = document.domain.match(/ibkr\.hk$/);
+    var lp_php = is_ib_hk ? reg_dom +'/mkt/registration.php?locale=zh_CN&w='+getCookie('web')+'&u=' : '/mkt/reg_lp.php?ap=';
+    //Iterate through all <a> and change to landing page
+    for (var i = 0; i < a.length; i++) 
+    {
+      var ibsrp = a[i].href.indexOf('ibsrp') != -1 ? '&ibsrp='+a[i].href.match(/(\&ibsrp=)([^\&]+)/).pop() : '';
+      var employer = a[i].href.indexOf('employer') != -1 ? 'employer='+a[i].href.match(/(\&employer=)([^\&]+)/).pop() : '';
+      var r_id = '';
+      if (a[i].href.indexOf('/Universal/servlet/formWelcome') != -1) {
+        if(a[i].href.indexOf('atype=IT&b=T&ibkrLite=V1') != -1) {
+          r_id = 'A15';
+        }
+        else if (a[i].href.indexOf('atype=IT&b=T') != -1) {
+          r_id = 'A2';
+        }
+        else if(a[i].href.indexOf('atype=ADV') != -1) {
+          r_id = 'A3';
+        } 
+        else if(a[i].href.indexOf('atype=FUNDS') != -1) {
+          r_id = 'A4';
+        } 
+        else if(a[i].href.indexOf('atype=MM&b=T') != -1) {
+          r_id = 'A5';
+        } 
+        else if(a[i].href.indexOf('atype=ORG') != -1) {
+          r_id = 'A6';
+        } 
+        else if(a[i].href.indexOf('atype=BRK') != -1) {
+          r_id = 'A7';
+        } 
+        else if(a[i].href.indexOf('atype=ET') != -1) {
+          r_id = 'A8';
+        } 
+        else if(a[i].href.indexOf('atype=ADMIN') != -1) {
+          r_id = 'A9';
+        } 
+        else if(a[i].href.indexOf('atype=REFERRER&subType=ORG') != -1) {
+          r_id = 'A10';
+        } 
+        else if (a[i].href.indexOf('atype=ORG&process=fully_electronic') != -1) {
+          r_id = 'A12';
+        } 
+        else if(a[i].href.indexOf('atype=REFERRER&subType=INDIVIDUAL') != -1) {
+          r_id = 'A13';
+        }
+        else if(a[i].href.indexOf('atype=ALLOCATOR') != -1) {
+          r_id = 'A16';
+        }
+      }
+      else if (a[i].href.indexOf('/Universal/servlet/Application.ApplicationSelector?ibkrLite=V1') != -1) {
+        r_id = 'A14';
+      }
+      else if (a[i].href.indexOf('/Universal/servlet/Application.ApplicationSelector') != -1) {
+        r_id = 'A1';
+      }
+      else if (a[i].href.indexOf('/Universal/Application?nri=T') != -1) {
+        r_id = 'A11';
+      } else if(a[i].href.indexOf('/sso/Login') != -1){
+      	a[i].href = a[i].href.indexOf('?') != -1 ? a[i].href + "&locale="+locale : a[i].href + "?locale="+locale;
+      }
+      if (r_id != ''){
+           a[i].href = lp_php+ r_id + ibsrp + employer;
+           if(locale){
+	      if(a[i].href.indexOf('?') != -1){
+	         a[i].href = a[i].href + "&locale="+locale;
+	      } else {
+	         a[i].href = a[i].href + "?locale="+locale;
+	      }
+	   }
+            if(location.href.match(/\.com\.sg\//)){
+               a[i].href = a[i].href.replace(".com.sg", ".com.hk");
+            }
+      }
+    }
+}
+function changeA2LP_bak() {
+    if (hasCookie('googlermkt', '1'))
+    {
+      return;
+    }
+    if (document.domain.match(/sports/))
+    {
+      return;
+    }
+    if (!document.domain.match(/(interactivebrokers|ibkr)\.com$|ibkr\.hk$/) || location.href.match(/\&prtnr=stkbrks/) || location.href.match(/\/cn\//))
+    {
+      return;
+    }
+    var is_ib_hk = document.domain.match(/ibkr\.hk$/);
+    var lp_php = is_ib_hk ? reg_dom +'/mkt/registration.php?locale=zh_CN&w='+getCookie('web')+'&u=' : '/mkt/reg_lp.php?ap=';
+    //Iterate through all <a> and change to landing page
+    var a = document.getElementsByTagName("a");
+    for (var i = 0; i < a.length; i++) 
+    {
+      var ibsrp = a[i].href.indexOf('ibsrp') != -1 ? '&ibsrp='+a[i].href.match(/(\&ibsrp=)([^\&]+)/).pop() : '';
+      var employer = a[i].href.indexOf('employer') != -1 ? 'employer='+a[i].href.match(/(\&employer=)([^\&]+)/).pop() : '';
+      var r_id = '';
+      if (a[i].href.indexOf('/Universal/servlet/formWelcome') != -1) {
+        if(a[i].href.indexOf('atype=IT&b=T&ibkrLite=V1') != -1) {
+          r_id = 'A15';
+        }
+        else if (a[i].href.indexOf('atype=IT&b=T') != -1) {
+          r_id = 'A2';
+        }
+        else if(a[i].href.indexOf('atype=ADV') != -1) {
+          r_id = 'A3';
+        } 
+        else if(a[i].href.indexOf('atype=FUNDS') != -1) {
+          r_id = 'A4';
+        } 
+        else if(a[i].href.indexOf('atype=MM&b=T') != -1) {
+          r_id = 'A5';
+        } 
+        else if(a[i].href.indexOf('atype=ORG') != -1) {
+          r_id = 'A6';
+        } 
+        else if(a[i].href.indexOf('atype=BRK') != -1) {
+          r_id = 'A7';
+        } 
+        else if(a[i].href.indexOf('atype=ET') != -1) {
+          r_id = 'A8';
+        } 
+        else if(a[i].href.indexOf('atype=ADMIN') != -1) {
+          r_id = 'A9';
+        } 
+        else if(a[i].href.indexOf('atype=REFERRER&subType=ORG') != -1) {
+          r_id = 'A10';
+        } 
+        else if (a[i].href.indexOf('atype=ORG&process=fully_electronic') != -1) {
+          r_id = 'A12';
+        } 
+        else if(a[i].href.indexOf('atype=REFERRER&subType=INDIVIDUAL') != -1) {
+          r_id = 'A13';
+        }
+        else if(a[i].href.indexOf('atype=ALLOCATOR') != -1) {
+          r_id = 'A16';
+        }
+      }
+      else if (a[i].href.indexOf('/Universal/servlet/Application.ApplicationSelector?ibkrLite=V1') != -1) {
+        r_id = 'A14';
+      }
+      else if (a[i].href.indexOf('/Universal/servlet/Application.ApplicationSelector') != -1) {
+        r_id = 'A1';
+      }
+      else if (a[i].href.indexOf('/Universal/Application?nri=T') != -1) {
+        r_id = 'A11';
+      }
+      if (r_id != ''){
+           a[i].href = lp_php+ r_id + ibsrp + employer;
+      }
+    }
+}
+/* Referral Trader Handling */
+function handleLinksForTracking(id)
+{
+  var targets = ["f=individualAccounts","f=friendsFamilyAccounts","f=smallBusinessAccounts","advisorsMain.php","moneymanagersMain.php","brokerMain.php","institutionalMain.php","fundMain.php","employeeTrackMain.php","Universal/servlet/formWelcome","Universal/servlet/AccountAccess.Login", "f=1590","f=commission","f=1591","f=2321","f=2324","f=5447","f=249","f=3144","f=260","f=648","f=974","f=1111","f=6084","f=2684","f=2413","f=2416","f=5483","f=3157","f=3322","f=3646","f=3647","f=3308","f=3648","f=6128"];
+  var a = document.getElementsByTagName("a");
+  for (var i = 0; i < a.length; i ++)
+  {
+    if (a[i].href == '#')
+    {
+      break;
+    }
+    var pnd_str = '';
+    if (a[i].href.indexOf('#') != -1)
+    {
+       pnd_str = a[i].href.substring(a[i].href.indexOf('#'), a[i].href.length);
+       if (pnd_str.length == 1)
+       {
+         pnd_str = '';
+       }
+       a[i].href = a[i].href.substring(0, a[i].href.indexOf('#'));
+    }
+    for (var j=0; j < targets.length; j ++)
+    {
+      if (a[i].href.indexOf(targets[j]) != -1)
+      {
+        if (a[i].href.indexOf("?") == -1)
+        {
+           a[i].href += '?tr_ref_id='+id;
+        } else {
+           a[i].href += '&tr_ref_id='+id;
+        }
+        a[i].href += pnd_str;
+        break;
+      }
+    }
+  }
+}
+/* Until links to new Guide are changed */
+function newGuideLinksSwap()
+{
+  var a = document.getElementsByTagName("a");
+  for (var i = 0; i < a.length; i++) 
+  {
+    if (a[i].href.indexOf('/twsguide.htm#usersguidebook/') != -1)
+    {
+       a[i].href = a[i].href.replace(/\/twsguide.htm#usersguidebook\//, '/twsguide_CSH.htm#usersguidebook/');
+    }
+    else if (a[i].href.indexOf('/webtrader2/servlet/login?DEMOMODE=true') != -1 && a[i].href.indexOf('redirect=off') == -1)
+    {
+       a[i].href = a[i].href.replace('DEMOMODE=true','DEMOMODE=true&redirect=off');
+    }
+    else if (a[i].href.indexOf('interactivebrokers.co.uk/contract_info/') != -1)
+    {
+       a[i].href = 'https://misc.interactivebrokers.com/cstools/contract_info';
+    }
+    else if(a[i].href.indexOf('www1.interactivebrokers.ch/contract_info/') != -1)
+    {
+       a[i].href = 'https://misc.interactivebrokers.com/cstools/contract_info';
+    }
+    if (document.domain == 'www.interactivebrokers.com' || document.domain == 'individuals.interactivebrokers.com' || document.domain == 'institutions.interactivebrokers.com' || document.domain == 'www.ibkr.com' || document.domain == 'interactivebrokers.com')
+    {
+      if (a[i].href.indexOf('https://www.interactivebrokers.com/sso/Login') != -1)
+      {
+        a[i].href = a[i].href.replace('www','ndcdyn');
+      }
+      else if (a[i].href.indexOf('https://www.interactivebrokers.com/Universal') != -1)
+      {
+        a[i].href = a[i].href.replace('www','ndcdyn');
+      }
+    }
+    else if (document.domain.match(/ibkr\.com\.cn/)) /* substitute of ibkr.com.cn */
+    {
+       var m = a[i].href.match(/\/([^\/]+)\/(Universal|sso)/);
+       if (m && m[1] && !m[1].match(/ibkr\.com\.cn/) && !m[1].match(/tradersmktpl/))
+       {
+         a[i].href = a[i].href.replace(m[1], 'www.ibkr.com.cn');
+       }
+    }
+  }
+}
+function fortifyInput(name)
+{
+  ok = "QWERTYUIOPASDFGHJKLZXCVBNMqwertyuiopasdfghjklzxcvbnm1234567890/.%?&-+=_@:;#";
+  out = "";
+  for(i=0;i < name.length; i++)
+  {
+    var ok_index = ok.indexOf(name.charAt(i));
+    if(ok_index >= 0)
+    {
+     out += ok.charAt(ok_index);
+    }
+  }
+  return out;
+}
+function registrationRedirect(accType){
+  self.location.href = "/mkt/reg_lp.php?ap="+accType;
+  return false;
+}
+function setFundingContentLang(){
+  var ele = document.getElementById("methodSearch");
+        if(ele){
+    var lang = getCookieValue("njwebconv_language");
+    if(lang == "tc"  && location.href.match(/\/cn\//)){
+      lang = "zh_TW";
+    } else if(location.href.match(/\/cn\//)) { 
+      lang = 'zh_CN'; 
+    } else if(lang == "fr" || location.href.match(/\/fr\//)) { 
+      lang = 'fr'; 
+    } else if(lang == "de" || location.href.match(/\/de\//)) { 
+      lang = 'de'; 
+    } else if(lang == "es" || location.href.match(/\/es\//)) { 
+      lang = 'es'; 
+    } else if(lang == "ru" || location.href.match(/\/ru\//)) { 
+      lang = 'ru'; 
+    } else if(lang == "it" || location.href.match(/\/it\//)) { 
+      lang = 'it'; 
+    } else if(lang == "jp" || location.href.match(/\/jp\//)) { 
+      lang = 'ja'; 
+    } else if(lang == "en" || location.href.match(/\/en\//) || !lang) { 
+      lang = 'en'; 
+    }
+    ele.setAttribute("data-language", lang);
+  }
+}
+addOnloadEvent(changeA2LP);
+addOnloadEvent(newGuideLinksSwap);
+if (typeof window.callIBRegistrationDomain == 'function'){
+  addOnloadEvent(callIBRegistrationDomain);
+}
