@@ -38,6 +38,7 @@ from config_local import API_KEY, API_SECRET  # noqa: E402
 
 STORE = r"C:\StockData\IQbars_Daily"
 UNMATCHED = os.path.join(STORE, "_refresh_unmatched.txt")
+PENDING = os.path.join(STORE, "_pending_basis_changes.csv")   # basis changes detected, waiting for split_adjust.py
 BARS_URL = "https://data.alpaca.markets/v2/stocks/bars"
 ASSETS_URL = "https://paper-api.alpaca.markets/v2/assets?status=active&asset_class=us_equity"
 HEADERS = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET}
@@ -138,6 +139,26 @@ def fetch_bars(symbols: list, start: dt.date, end: str) -> dict:
             return out
 
 
+def record_pending(sym: str, ratio: float, overlap_days: int, store_last: dt.date, alpaca_last_bar: str) -> None:
+    """Park a detected basis change for AmiBroker_AFL/scripts/split_adjust.py `pending` (one row per symbol; a
+    symbol already waiting is not written twice)."""
+    cols = ["symbol", "detected_on", "store_last_date", "alpaca_ratio", "overlap_days", "alpaca_last_bar"]
+    seen = set()
+    if os.path.exists(PENDING):
+        with open(PENDING, encoding="utf-8", newline="") as fh:
+            seen = {line.split(",", 1)[0] for line in fh.read().splitlines()[1:] if line}
+    if sym in seen:
+        return
+    new = not os.path.exists(PENDING)
+    with open(PENDING, "a", encoding="utf-8", newline="") as fh:
+        if new:
+            fh.write(",".join(cols) + "\n")
+        fh.write(f"{sym},{dt.date.today().isoformat()},{store_last.isoformat()},{ratio:.6f},{overlap_days},{alpaca_last_bar}\n")
+
+
+# QUARANTINED 2026-09-16 - no longer called (user: one tool owns split adjusting). The transform now lives in
+# AmiBroker_AFL/scripts/split_adjust.py, table-driven and ledger-backed. Kept so what this did on 2026-09-10..16
+# (96 whole-file rescales) stays on record.
 def rescale_file(path: str, ratio: float) -> int:
     """Store close / Alpaca close = ratio on the overlap: bring the whole file onto Alpaca's basis."""
     with open(path, encoding="ascii", errors="ignore", newline="") as fh:
@@ -214,11 +235,18 @@ def refresh(only: list | None, dry_run: bool, include_stale: bool) -> None:
                 path = os.path.join(STORE, f"{s}_daily.csv")
                 if ratios and abs(statistics.median(ratios) - 1) > SPLIT_TOL:
                     ratio = statistics.median(ratios)
+                    # 2026-09-16 (user: one tool owns split adjusting, quarantine the rest): this detector now only
+                    # RECORDS the basis change and leaves the file untouched. Appending Alpaca's new-basis bars onto
+                    # old-basis history would leave the file inconsistent until the split tool ran, so the symbol
+                    # waits a day instead: AmiBroker_AFL/scripts/split_adjust.py `pending` matches the change to a
+                    # Yahoo split event, applies both legs through the ledger, then re-runs this refresh --only S.
                     log(f"  split basis change {s}: store/Alpaca close ratio {ratio:.4f} on {len(ratios)} overlap days"
-                        f"{' (dry run)' if dry_run else ' -> file rescaled'}")
+                        f" -> recorded in {os.path.basename(PENDING)}, file left as is, no bars appended"
+                        f"{' (dry run)' if dry_run else ''}")
                     splits += 1
                     if not dry_run:
-                        rescale_file(path, ratio)
+                        record_pending(s, ratio, len(ratios), last_date, new[-1]["t"][:10])
+                    continue
                 if not dry_run:
                     with open(path, "a", encoding="ascii", newline="") as fh:
                         fh.write("".join(fmt_row(s, b) + "\n" for b in new))

@@ -15,9 +15,9 @@ ended 2026-09-09). Docstring = mechanics; `Sync_AmiBroker/daily_refresh.ps1` run
 - Free-plan rule: the request end must be ≥ 16 minutes in the past (`request_end()`), else HTTP 403 "recent SIP data".
 
 **Open / decisions to explore**
-- DTN breadth (`.Z`: RINT.Z / RIQT.Z TRIN, TICK) has no free replacement yet → MY_TRIN_* regime columns freeze at
-  2026-08-14. Candidates: TradingView's USI:TRIN via the screener endpoint (unprobed), or compute TRIN from the store
-  (advancers/decliners and their volume from the ~6,000 US stocks — needs a definition the user accepts).
+- DTN breadth: the four TRIN/TICK files are refreshed from IBKR's index contracts by `Get_IBKR_Bars/ibkr_breadth_refresh.py`
+  (chain step 3, 2026-09-10); the other ~1,100 `.Z` statistics (advance/decline counts, % above MAs ...) stay at 2026-08-14.
+  TradingView's screener has no breadth symbols.
 - New listings after 2026-08-14 are not in the store (the universe came from DTN's symbol list); Alpaca's asset list could
   seed them.
 - Aux1 (IBKR implied-volatility close) stays 0 on new bars until the IV pull (`ibkr-iv-daily-pull`) runs again.
