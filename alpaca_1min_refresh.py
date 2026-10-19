@@ -31,6 +31,9 @@ data). Never printed.
 
 usage:  python alpaca_1min_refresh.py [--dry-run] [--symbols AAPL,KR,SPY] [--all] [--store adjusted|raw|both]
         (own visible window; ends with REFRESH-1MIN-DONE)
+Scheduled since 2026-10-18 (user: "the store needs to be fixed and restarted as well"): refresh_1min_task.ps1 registers
+"1-minute store refresh" (weekdays 21:30) running refresh_1min.ps1 = this tool for both stores, then
+AmiBroker_AFL/scripts/split_adjust.py pending --store 1min for the parked basis changes.
 """
 from __future__ import annotations
 
