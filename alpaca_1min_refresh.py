@@ -48,6 +48,8 @@ import urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from alpaca_daily_refresh import (BARS_URL, NY, SKIP_SUFFIX, STALE_DAYS, alpaca_assets,  # noqa: E402
                                   alpaca_name, get_json, log, parse_mdy)
+from common_trading_lib import read_store_bars  # noqa: E402  (installed editable into C:\Python314 on 2026-10-21)
+from common_trading_lib import write_store_bars  # noqa: E402  (REQ-005, v0.8.0, 2026-10-22)
 
 STORES = {"adjusted": (r"C:\StockData\IQbars_1min_adjusted", "split"),
           "raw": (r"C:\StockData\IQbars_1min", "raw")}
@@ -57,7 +59,6 @@ BATCH = 25                     # symbols per request; ~4,700 new bars each, so a
 PAGE_LIMIT = 10000
 SPLIT_TOL = 0.002              # 0.2% - wider than a rounding difference, far narrower than any split
 MIN_OVERLAP = 20               # shared minutes needed before the ratio is trusted
-TAIL_BYTES = 131072            # covers a full 04:00-19:59 day (960 bars) of any symbol's rows
 SESSION_END = dt.time(20, 10)  # today's bars are complete only after this
 FIRST_MINUTE = "04:00"
 LAST_MINUTE = "19:59"
@@ -88,26 +89,14 @@ def store_symbols(store_dir: str) -> list:
 def tail_day_rows(path: str) -> tuple:
     """(last date MM/DD/YYYY, last time HH:MM, {HH:MM: close}) for a store file's final day, read from its tail.
 
-    Only the last TAIL_BYTES are read, so a 3.7-million-row file costs one seek. Returns ('', '', {}) for a file
-    with no usable data rows.
+    Through common_trading_lib.read_store_bars since 2026-10-21 (REQ-003; the 128 KB tail read it replaces lived here):
+    one backward byte window, so a 3.7-million-row file still costs one seek. Returns ('', '', {}) for a file with no
+    usable data rows.
     """
-    with open(path, "rb") as fh:
-        fh.seek(0, os.SEEK_END)
-        size = fh.tell()
-        fh.seek(max(0, size - TAIL_BYTES))
-        chunk = fh.read().decode("ascii", "ignore")
-    lines = chunk.splitlines()
-    if size > TAIL_BYTES and lines:
-        lines = lines[1:]                                   # the window may have cut the first line in half
-    rows = []
-    for line in lines:
-        p = line.split(",")
-        if len(p) >= 8 and len(p[1]) == 10 and len(p[2]) == 5 and p[1][2] == "/":
-            rows.append(p)
-    if not rows:
+    df = read_store_bars(os.path.dirname(path), os.path.basename(path)[:-len("_1.csv")], "1 min", last_sessions=1)
+    if df.empty:
         return "", "", {}
-    last_date = rows[-1][1]
-    return last_date, rows[-1][2], {p[2]: float(p[6]) for p in rows if p[1] == last_date}
+    return df["Date"].iloc[-1], df["Time"].iloc[-1], dict(zip(df["Time"].tolist(), df["Close"].tolist()))
 
 
 def et_date_time(ts: str) -> tuple:
@@ -154,15 +143,6 @@ def fetch_bars(names: dict, start: str, end: str, adjustment: str) -> dict:
         token = r.get("next_page_token")
         if not token:
             return out
-
-
-def append_rows(path: str, lines: list) -> None:
-    """Append formatted rows in one write. Append mode after the checks: existing rows are never rewritten and a
-    crash cannot truncate the file."""
-    with open(path, "a", encoding="ascii", newline="") as fh:
-        fh.write("".join(line + "\n" for line in lines))
-        fh.flush()
-        os.fsync(fh.fileno())
 
 
 def record_split_pending(store: str, sym: str, ratio: float, overlap: int, last_date: str) -> None:
@@ -217,7 +197,7 @@ def refresh_store(store: str, only: list | None, dry_run: bool, include_stale: b
     by_last = {}
     for item in work:
         by_last.setdefault(item[2], []).append(item)
-    done = appended = files = pending = thin = empty = 0
+    done = appended = files = pending = thin = empty = refused = 0
     t0 = time.time()
     mark = PROGRESS_EVERY
     for last, items in sorted(by_last.items()):
@@ -249,7 +229,12 @@ def refresh_store(store: str, only: list | None, dry_run: bool, include_stale: b
                         f"appending {len(new):,} bars anyway")
                     thin += 1
                 if not dry_run:
-                    append_rows(path, new)
+                    try:                                    # 2026-10-22 (REQ-005): the library's store writer, one write + fsync
+                        write_store_bars(store_dir, s, "1 min", new)
+                    except ValueError as e:                 # a refused batch: nothing written, logged, the run goes on
+                        log(f"  [{store}] {s}: batch REFUSED by write_store_bars, nothing written - {e}")
+                        refused += 1
+                        continue
                 appended += len(new)
                 files += 1
             done += len(batch)
@@ -260,7 +245,7 @@ def refresh_store(store: str, only: list | None, dry_run: bool, include_stale: b
                 mark = done + PROGRESS_EVERY
     log(f"[{store}] {'DRY RUN: would append' if dry_run else 'appended'} {appended:,} bars to {files:,} files; "
         f"split basis changes {pending} (nothing appended, see {os.path.basename(PENDING)}); thin overlap {thin}; "
-        f"no new bars {empty:,}; {time.time() - t0:.0f}s")
+        f"no new bars {empty:,}; refused {refused}; {time.time() - t0:.0f}s")
 
 
 def main() -> int:

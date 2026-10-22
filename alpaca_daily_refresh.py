@@ -35,6 +35,8 @@ import zoneinfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config_local import API_KEY, API_SECRET  # noqa: E402
+from common_trading_lib import read_store_bars  # noqa: E402  (installed editable into C:\Python314 on 2026-10-21)
+from common_trading_lib import write_store_bars  # noqa: E402  (REQ-005, v0.8.0, 2026-10-22)
 
 STORE = r"C:\StockData\IQbars_Daily"
 UNMATCHED = os.path.join(STORE, "_refresh_unmatched.txt")
@@ -94,15 +96,12 @@ def alpaca_name(sym: str, assets: set) -> str:
 
 
 def tail_rows(path: str, n: int = 40) -> list:
-    """The last n data rows of a store file as lists of fields (newest last)."""
-    with open(path, "rb") as fh:
-        fh.seek(0, os.SEEK_END)
-        size = fh.tell()
-        fh.seek(max(0, size - 16384))
-        chunk = fh.read().decode("ascii", "ignore")
-    lines = [l for l in chunk.splitlines() if l and not l.startswith("Symbol,")]
-    rows = [l.split(",") for l in lines[-n:]]
-    return [r for r in rows if len(r) >= 8 and len(r[1]) == 10]
+    """The last n data rows of a store file as lists of text fields (newest last). Through
+    common_trading_lib.read_store_bars since 2026-10-21 (REQ-003; the 16 KB tail read it replaces lived here): the last n
+    sessions, which on a daily file are the last n rows. Prices come back as float text ('8.0' for a stored '8.00'); the
+    callers read the date (r[1]) and float(r[6])."""
+    df = read_store_bars(STORE, os.path.basename(path)[:-len("_daily.csv")], "1 day", last_sessions=n)
+    return [[str(v) for v in row] for row in df[list(df.columns[:8])].itertuples(index=False)]
 
 
 def parse_mdy(s: str) -> dt.date:
@@ -210,7 +209,7 @@ def refresh(only: list | None, dry_run: bool, include_stale: bool) -> None:
         fh.write("\n".join(unmatched))
     log(f"to refresh {len(work):,}; already current {current:,}; stale (> {STALE_DAYS} days, delisted?) {stale:,}; "
         f"not on Alpaca {len(unmatched):,} -> {UNMATCHED}")
-    appended = files = splits = empty = 0
+    appended = files = splits = empty = refused = 0
     t0 = time.time()
     end = request_end(allowed)
     log(f"request window ends {end}")
@@ -232,7 +231,6 @@ def refresh(only: list | None, dry_run: bool, include_stale: bool) -> None:
                     key = f"{b['t'][5:7]}/{b['t'][8:10]}/{b['t'][0:4]}"
                     if key in closes and b["c"]:
                         ratios.append(closes[key] / b["c"])
-                path = os.path.join(STORE, f"{s}_daily.csv")
                 if ratios and abs(statistics.median(ratios) - 1) > SPLIT_TOL:
                     ratio = statistics.median(ratios)
                     # 2026-09-16 (user: one tool owns split adjusting, quarantine the rest): this detector now only
@@ -248,15 +246,19 @@ def refresh(only: list | None, dry_run: bool, include_stale: bool) -> None:
                         record_pending(s, ratio, len(ratios), last_date, new[-1]["t"][:10])
                     continue
                 if not dry_run:
-                    with open(path, "a", encoding="ascii", newline="") as fh:
-                        fh.write("".join(fmt_row(s, b) + "\n" for b in new))
+                    try:                                    # 2026-10-22 (REQ-005): the library's store writer, one write + fsync
+                        write_store_bars(STORE, s, "1 day", [fmt_row(s, b) for b in new])
+                    except ValueError as e:                 # a refused batch: nothing written, logged, the run goes on
+                        log(f"  {s}: batch REFUSED by write_store_bars, nothing written - {e}")
+                        refused += 1
+                        continue
                 appended += len(new)
                 files += 1
             done = i + len(batch)
             if done % (BATCH * 10) == 0 or done == len(items):
                 log(f"  {done:,}/{len(items):,} symbols ending {last}  files +{files:,} bars +{appended:,}  {time.time() - t0:.0f}s")
     log(f"{'DRY RUN: would append' if dry_run else 'appended'} {appended:,} bars to {files:,} files; splits {splits}; "
-        f"no new bars {empty:,}; {time.time() - t0:.0f}s")
+        f"no new bars {empty:,}; refused {refused}; {time.time() - t0:.0f}s")
     print("REFRESH-DONE", flush=True)
 
 
