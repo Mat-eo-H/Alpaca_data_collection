@@ -50,6 +50,8 @@ from alpaca_daily_refresh import (BARS_URL, NY, SKIP_SUFFIX, STALE_DAYS, alpaca_
                                   alpaca_name, get_json, log, parse_mdy)
 from common_trading_lib import read_store_bars  # noqa: E402  (installed editable into C:\Python314 on 2026-10-21)
 from common_trading_lib import write_store_bars  # noqa: E402  (REQ-005, v0.8.0, 2026-10-22)
+from common_trading_lib import StoreLockTimeout, store_lock  # noqa: E402  (REQ-007, v0.10.0, 2026-10-22)
+from alpaca_daily_refresh import LOCK_BUSY_EXIT, LOCK_TIMEOUT_S, lock_log  # noqa: E402
 
 STORES = {"adjusted": (r"C:\StockData\IQbars_1min_adjusted", "split"),
           "raw": (r"C:\StockData\IQbars_1min", "raw")}
@@ -64,6 +66,7 @@ FIRST_MINUTE = "04:00"
 LAST_MINUTE = "19:59"
 MAX_PER_MIN = 180              # Alpaca's free market-data plan allows 200/min; this tool makes ~12,000 a run
 PROGRESS_EVERY = 200
+CREATE_DAYS = 45               # --create-missing: ~30 sessions, enough for the 20-session lookbacks (cumulative RVOL)
 _REQUEST_TIMES: list = []
 
 
@@ -161,8 +164,10 @@ def record_split_pending(store: str, sym: str, ratio: float, overlap: int, last_
 
 
 def refresh_store(store: str, only: list | None, dry_run: bool, include_stale: bool, assets: set,
-                  allowed: dt.date) -> None:
-    """Top one store off: scan its files' last bars, fetch, basis-check, append. Logs its own summary."""
+                  allowed: dt.date, create_missing: bool = False) -> None:
+    """Top one store off: scan its files' last bars, fetch, basis-check, append. Logs its own summary.
+    `create_missing` (with `only`, 2026-10-22, the refresh watcher): a symbol with no store file gets one holding the
+    last CREATE_DAYS calendar days, through `allowed`."""
     store_dir, adjustment = STORES[store]
     syms = only or store_symbols(store_dir)
     log(f"[{store}] {len(syms):,} symbols in {store_dir}; adjustment={adjustment}; bars accepted through {allowed}")
@@ -171,6 +176,12 @@ def refresh_store(store: str, only: list | None, dry_run: bool, include_stale: b
     for s in syms:
         path = os.path.join(store_dir, f"{s}_1.csv")
         if not os.path.exists(path):
+            a = alpaca_name(s, assets) if create_missing and only else ""
+            if a:                                   # a new file: fetched from CREATE_DAYS back, every bar is new
+                first = allowed - dt.timedelta(days=CREATE_DAYS)
+                work.append((s, a, first, f"{first:%m/%d/%Y}", ""))
+                log(f"  [{store}] {s}: no store file - creating it from {first}")
+                continue
             missing += 1
             continue
         last_date, last_time, _ = tail_day_rows(path)
@@ -213,6 +224,13 @@ def refresh_store(store: str, only: list | None, dry_run: bool, include_stale: b
                     empty += 1
                     continue
                 path = os.path.join(store_dir, f"{s}_1.csv")
+                if not os.path.exists(path):                # --create-missing: nothing stored to check the basis against
+                    if not dry_run:
+                        write_store_bars(store_dir, s, "1 min", new)
+                    log(f"  [{store}] {s}: {'would create' if dry_run else 'created'} with {len(new):,} bars")
+                    appended += len(new)
+                    files += 1
+                    continue
                 _, _, closes = tail_day_rows(path)
                 ratios = [closes[t] / c for d, t, c, _ in got if d == last_date and c and t in closes]
                 ratio = statistics.median(ratios) if ratios else 1.0
@@ -254,6 +272,10 @@ def main() -> int:
     ap.add_argument("--symbols", help="comma list (smoke test)")
     ap.add_argument("--all", action="store_true", help=f"include files older than {STALE_DAYS} days (the full run)")
     ap.add_argument("--store", choices=["adjusted", "raw", "both"], default="both")
+    ap.add_argument("--create-missing", action="store_true",
+                    help=f"with --symbols: create a missing store file holding the last {CREATE_DAYS} calendar days")
+    ap.add_argument("--lock-timeout", type=float, default=LOCK_TIMEOUT_S,
+                    help=f"seconds to wait for another writer of a store (default {LOCK_TIMEOUT_S}; 0 = one try)")
     a = ap.parse_args()
     now = dt.datetime.now(NY)
     allowed = now.date() if now.time() >= SESSION_END else now.date() - dt.timedelta(days=1)
@@ -261,7 +283,12 @@ def main() -> int:
     log(f"Alpaca active assets {len(assets):,}; newest session accepted {allowed} (now {now:%Y-%m-%d %H:%M} ET)")
     only = [s.strip().upper() for s in a.symbols.split(",")] if a.symbols else None
     for store in (["adjusted", "raw"] if a.store == "both" else [a.store]):
-        refresh_store(store, only, a.dry_run, a.all, assets, allowed)
+        try:                                        # 2026-10-22 (REQ-007): one lock per store pass
+            with store_lock(STORES[store][0], "alpaca_1min_refresh", timeout_s=a.lock_timeout, log=lock_log):
+                refresh_store(store, only, a.dry_run, a.all, assets, allowed, a.create_missing)
+        except StoreLockTimeout as e:
+            print(f"LOCK-BUSY [{store}] {e}", flush=True)
+            return LOCK_BUSY_EXIT
     print("REFRESH-1MIN-DONE", flush=True)
     return 0
 

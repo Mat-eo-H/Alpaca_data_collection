@@ -21,6 +21,9 @@ $repo = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script = Join-Path $repo "refresh_1min.ps1"
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File `"$script`""
 $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday, Tuesday, Wednesday, Thursday, Friday -At $At
+# 2026-11-02: the cmdlet writes the start time with a zone (an offset or Z), which Task Scheduler reads as "synchronize across
+# time zones" - after a DST change the task fires an hour early by the clock. A boundary without the zone is local time.
+$trigger.StartBoundary = ([datetime]$trigger.StartBoundary).ToString('yyyy-MM-ddTHH:mm:ss')
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 6) -StartWhenAvailable -MultipleInstances IgnoreNew   # two stores, ~12,000 paged requests each at 180 a minute
 Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null

@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config_local import API_KEY, API_SECRET  # noqa: E402
 from common_trading_lib import read_store_bars  # noqa: E402  (installed editable into C:\Python314 on 2026-10-21)
 from common_trading_lib import write_store_bars  # noqa: E402  (REQ-005, v0.8.0, 2026-10-22)
+from common_trading_lib import StoreLockTimeout, store_lock  # noqa: E402  (REQ-007, v0.10.0, 2026-10-22)
 
 STORE = r"C:\StockData\IQbars_Daily"
 UNMATCHED = os.path.join(STORE, "_refresh_unmatched.txt")
@@ -51,10 +52,18 @@ OVERLAP_DAYS = 10
 STALE_DAYS = 45
 SPLIT_TOL = 0.005
 CLOSE_TIME = dt.time(16, 10)
+CREATE_START = dt.date(2016, 1, 1)   # --create-missing: Alpaca's SIP daily history starts in 2016
+LOCK_TIMEOUT_S = 1800                # the store lock (REQ-007): how long a nightly run waits for another writer
+LOCK_BUSY_EXIT = 75                  # the exit code when the lock stayed held: "busy, ask again" (the refresh watcher)
 
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def lock_log(message: str, level: str = "INFO") -> None:
+    """store_lock's log callable: its lines (waiting for a holder, a broken stale lock) into this window."""
+    log(f"{level} {message}")
 
 
 def get_json(url: str, retries: int = 5):
@@ -178,17 +187,45 @@ def rescale_file(path: str, ratio: float) -> int:
     return n
 
 
-def refresh(only: list | None, dry_run: bool, include_stale: bool) -> None:
+def create_files(creates: list, allowed: dt.date, end: str, dry_run: bool) -> int:
+    """Write a NEW store file for each (DTN symbol, Alpaca symbol) in `creates` from Alpaca's daily history since
+    CREATE_START through `allowed` (2026-10-22: the refresh watcher's create-file mode for a name the store lacks, e.g. a
+    new listing). Returns the files written; a symbol Alpaca has no bars for is logged and skipped."""
+    written = 0
+    for i in range(0, len(creates), BATCH):
+        batch = creates[i:i + BATCH]
+        bars = fetch_bars([a for _, a in batch], CREATE_START, end)
+        for s, a in batch:
+            got = [b for b in bars.get(a, []) if parse_mdy(f"{b['t'][5:7]}/{b['t'][8:10]}/{b['t'][0:4]}") <= allowed]
+            if not got:
+                log(f"  {s}: no store file and Alpaca has no daily bars - not created")
+                continue
+            if not dry_run:
+                write_store_bars(STORE, s, "1 day", [fmt_row(s, b) for b in got])
+            written += 1
+            log(f"  {s}: {'would create' if dry_run else 'created'} {s}_daily.csv, {len(got):,} bars "
+                f"{got[0]['t'][:10]} .. {got[-1]['t'][:10]}")
+    return written
+
+
+def refresh(only: list | None, dry_run: bool, include_stale: bool, through: dt.date | None = None,
+            create_missing: bool = False) -> None:
     now = dt.datetime.now(NY)
     allowed = now.date() if now.time() >= CLOSE_TIME else now.date() - dt.timedelta(days=1)   # newest bar accepted
+    if through is not None:                         # 2026-10-22: the refresh watcher never writes today's bar early
+        allowed = min(allowed, through)
     assets = alpaca_assets()
     syms = only or store_symbols()
     log(f"store symbols {len(syms):,}; Alpaca active assets {len(assets):,}; bars accepted through {allowed}")
-    work, unmatched, stale, current = [], [], 0, 0
+    work, unmatched, stale, current, creates = [], [], 0, 0, []
     for s in syms:
         path = os.path.join(STORE, f"{s}_daily.csv")
         if not os.path.exists(path):
-            log(f"  no store file for {s} - skipped")
+            a = alpaca_name(s, assets) if create_missing and only else ""
+            if a:
+                creates.append((s, a))
+            else:
+                log(f"  no store file for {s} - skipped")
             continue
         rows = tail_rows(path)
         if not rows:
@@ -205,14 +242,18 @@ def refresh(only: list | None, dry_run: bool, include_stale: bool) -> None:
             unmatched.append(s)
             continue
         work.append((s, a, last, {r[1]: float(r[6]) for r in rows}))
-    with open(UNMATCHED, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(unmatched))
+    if only is None and not dry_run:                # 2026-10-22: a --symbols run (the refresh watcher) must not clobber the full list
+        with open(UNMATCHED, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(unmatched))
     log(f"to refresh {len(work):,}; already current {current:,}; stale (> {STALE_DAYS} days, delisted?) {stale:,}; "
         f"not on Alpaca {len(unmatched):,} -> {UNMATCHED}")
     appended = files = splits = empty = refused = 0
     t0 = time.time()
     end = request_end(allowed)
     log(f"request window ends {end}")
+    if creates:
+        log(f"creating {len(creates)} missing files from {CREATE_START} through {allowed}")
+        files += create_files(creates, allowed, end, dry_run)
     by_last = {}
     for item in work:
         by_last.setdefault(item[2], []).append(item)
@@ -267,8 +308,20 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--symbols", help="comma list (smoke test)")
     ap.add_argument("--all", action="store_true", help=f"include files older than {STALE_DAYS} days")
+    ap.add_argument("--through", type=dt.date.fromisoformat,
+                    help="newest session accepted, YYYY-MM-DD (the refresh watcher passes the last session before today)")
+    ap.add_argument("--create-missing", action="store_true",
+                    help=f"with --symbols: create a missing store file from Alpaca's daily history since {CREATE_START}")
+    ap.add_argument("--lock-timeout", type=float, default=LOCK_TIMEOUT_S,
+                    help=f"seconds to wait for another writer of the store (default {LOCK_TIMEOUT_S}; 0 = one try)")
     a = ap.parse_args()
-    refresh([s.strip().upper() for s in a.symbols.split(",")] if a.symbols else None, a.dry_run, a.all)
+    try:                                            # 2026-10-22 (REQ-007): one lock around the whole store pass
+        with store_lock(STORE, "alpaca_daily_refresh", timeout_s=a.lock_timeout, log=lock_log):
+            refresh([s.strip().upper() for s in a.symbols.split(",")] if a.symbols else None, a.dry_run, a.all,
+                    a.through, a.create_missing)
+    except StoreLockTimeout as e:
+        print(f"LOCK-BUSY {e}", flush=True)
+        return LOCK_BUSY_EXIT
     return 0
 
 

@@ -42,9 +42,10 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from alpaca_daily_refresh import NY, alpaca_assets, alpaca_name, log, parse_mdy  # noqa: E402
+from alpaca_daily_refresh import LOCK_BUSY_EXIT, NY, alpaca_assets, alpaca_name, lock_log, log, parse_mdy  # noqa: E402
 from alpaca_1min_refresh import (MIN_OVERLAP, SPLIT_TOL, STORES, fetch_bars, request_window,  # noqa: E402
                                  tail_day_rows)
+from common_trading_lib import StoreLockTimeout, store_lock  # noqa: E402  (REQ-007, v0.10.0, 2026-10-22)
 
 OUT_ROOT = r"C:\StockData\alpaca_today"
 STATUS = os.path.join(OUT_ROOT, "_status.txt")
@@ -52,6 +53,7 @@ LIST_PATH = r"C:\StockData\report_requests\alpaca_today_{date}.txt"
 HEADER = "Symbol,Date,Time,Open,High,Low,Close,Volume\n"
 BATCH = 25                      # symbols per request, the refresher's size (~2 sessions of bars each, a few pages)
 LOOKBACK_DAYS = 10              # a store tail older than this is not fetched from (a reused ticker could ask for years)
+LOCK_TIMEOUT_S = 300            # the folder's lock (REQ-007): the report's pull and the watcher's pulls share it
 FIELDS = ["symbol", "alpaca", "store_last", "first_bar", "last_bar", "bars", "ratio", "overlap", "status",
           "early_changed"]
 
@@ -88,8 +90,9 @@ def et_time(utc_stamp: str) -> dt.datetime:
     return dt.datetime.strptime(utc_stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).astimezone(NY)
 
 
-def pull(day: dt.date, syms: list, out_dir: str) -> str:
-    """Fetch, basis-check and write every listed symbol into out_dir; returns the DONE marker text."""
+def pull(day: dt.date, syms: list, out_dir: str, side_files: bool = True) -> str:
+    """Fetch, basis-check and write every listed symbol into out_dir; returns the DONE marker text. `side_files=False`
+    (--no-status, the refresh watcher's calls) leaves the date folder's _symbols.csv as the report's pull wrote it."""
     assets = alpaca_assets()
     store_dir, adjustment = STORES["adjusted"]
     info, groups = {}, {}
@@ -145,8 +148,12 @@ def pull(day: dt.date, syms: list, out_dir: str) -> str:
                 r["bars"] = len(new)
             log(f"  {min(i + BATCH, len(members)):,}/{len(members):,} symbols")
     rows = list(info.values())
-    write_whole(os.path.join(out_dir, "_symbols.csv"),
-                ",".join(FIELDS) + "\n" + "".join(",".join(str(r[f]) for f in FIELDS) + "\n" for r in rows))
+    if side_files:
+        write_whole(os.path.join(out_dir, "_symbols.csv"),
+                    ",".join(FIELDS) + "\n" + "".join(",".join(str(r[f]) for f in FIELDS) + "\n" for r in rows))
+    else:                                            # the watcher reads the per-symbol outcome from this log
+        for r in rows:
+            log(f"  {r['symbol']}: {r['status']} bars={r['bars']} first={r['first_bar']} last={r['last_bar']}")
     count = {k: sum(1 for r in rows if r["status"] == k) for k in ("basis-change", "not-on-alpaca", "no-bars")}
     early = [r["early_changed"] for r in rows if r["early_changed"] != ""]
     log(f"early copies compared {len(early)}: {sum(1 for n in early if n)} revised, {sum(early):,} minutes changed")
@@ -173,6 +180,10 @@ def main() -> int:
     ap.add_argument("--list", help=f"symbol list file (default {LIST_PATH})")
     ap.add_argument("--symbols", help="comma list instead of the list file (smoke test)")
     ap.add_argument("--wait-list", type=float, default=10, help="minutes to wait for the list file (default 10)")
+    ap.add_argument("--no-status", action="store_true",
+                    help="with --symbols (the refresh watcher): leave _status.txt and _symbols.csv to the report's pull")
+    ap.add_argument("--lock-timeout", type=float, default=LOCK_TIMEOUT_S,
+                    help=f"seconds to wait for another pull of the folder (default {LOCK_TIMEOUT_S}; 0 = one try)")
     a = ap.parse_args()
     day = dt.date.fromisoformat(a.date) if a.date else dt.datetime.now(NY).date()
     out_dir = os.path.join(OUT_ROOT, day.isoformat())
@@ -186,14 +197,20 @@ def main() -> int:
         if not syms:
             mark(f"FAILED {day} no-list (nothing at {path} after {a.wait_list:g} min)")
             return 1
-    mark(f"RUNNING {day} pulling {len(syms)} symbols")
+    note = log if a.no_status else mark             # --no-status: the report's marker is never touched
+    note(f"RUNNING {day} pulling {len(syms)} symbols")
     t0 = time.time()
     try:
-        done = pull(day, syms, out_dir)
+        with store_lock(OUT_ROOT, "alpaca_today_pull", timeout_s=a.lock_timeout, log=lock_log):
+            done = pull(day, syms, out_dir, side_files=not a.no_status)
+    except StoreLockTimeout as e:                    # another pull holds the folder: busy, not broken
+        note(f"FAILED {day} lock busy - {e}")
+        print("LOCK-BUSY", flush=True)
+        return LOCK_BUSY_EXIT
     except (Exception, SystemExit) as e:
-        mark(f"FAILED {day} {str(e).strip('! ') or type(e).__name__}")
+        note(f"FAILED {day} {str(e).strip('! ') or type(e).__name__}")
         raise
-    mark(done)
+    note(done)
     log(f"{time.time() - t0:.0f}s")
     print("ALPACA-TODAY-DONE", flush=True)
     return 0

@@ -21,6 +21,9 @@ $repo = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script = Join-Path $repo "alpaca_today_pull.ps1"
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File `"$script`""
 $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday, Tuesday, Wednesday, Thursday, Friday -At $At
+# 2026-11-02: the cmdlet writes the start time with a zone (an offset or Z), which Task Scheduler reads as "synchronize across
+# time zones" - after a DST change the task fires an hour early by the clock. A boundary without the zone is local time.
+$trigger.StartBoundary = ([datetime]$trigger.StartBoundary).ToString('yyyy-MM-ddTHH:mm:ss')
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -StartWhenAvailable -MultipleInstances IgnoreNew   # a 10-minute wait for the list + a short pull
 Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
