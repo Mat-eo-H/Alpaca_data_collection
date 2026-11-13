@@ -1,22 +1,24 @@
-r"""alpaca_1min_refresh.py - append the latest 1-minute SIP bars from Alpaca to every <SYM>_1.csv in the two 1-minute
-stores (the DTN/IQFeed subscription that fed them ended 2026-09-09 and both stores stop on 2026-08-14; user decision
+r"""alpaca_1min_refresh.py - append the latest 1-minute SIP bars from Alpaca to every <SYM>_1.csv in the 1-minute
+store (the DTN/IQFeed subscription that fed it ended 2026-09-09 and its DTN bars stop on 2026-08-14; user decision
 2026-09-18: "top the 1-minute store off from Alpaca, the way the daily store already is").
 
-Two stores, same layout and the same symbol list, refreshed independently (--store):
+ONE store since 2026-11-12:
   C:\StockData\IQbars_1min_adjusted\<SYM>_1.csv   split-adjusted to today's basis  (Alpaca adjustment=split)
-  C:\StockData\IQbars_1min\<SYM>_1.csv            raw, as traded                   (Alpaca adjustment=raw)
+Its raw, as-traded twin C:\StockData\IQbars_1min (Alpaca adjustment=raw) was a second full download every night that no
+program read; it was deleted on 2026-11-12 with --store raw|both (user: "we only need the adjusted store. The raw store
+was saved during conversion and no longer needed").
 Rows are SYM,MM/DD/YYYY,HH:MM,O,H,L,C,V - 4-decimal prices, whole volume, Time = the bar's START minute in US/Eastern
 (09:30 holds the opening print, 16:00 the closing auction), 04:00..19:59 only, in time order. The AmiBroker 1-minute
 database is rebuilt from the adjusted store by a separate tool; this one only appends rows.
 
-Per run (hours for ~12,900 symbols x 2 stores):
+Per run (~12,000 symbols):
   1. Lists the store's <SYM>_1.csv files (DTN names), skipping the breadth / index families (.Z .X .XO are not on
      Alpaca) and, unless --all, files whose last bar is older than STALE_DAYS (delisted). Maps DTN names to Alpaca
      names against Alpaca's active asset list (identical for common stock, class shares, .WS warrants and .U units;
      preferreds ABR-D -> ABR.PRD). Names Alpaca does not know go to _refresh_unmatched_1min.txt and are left alone
      (one unknown symbol fails the whole request).
-  2. Reads each file's final day from its last TAIL_BYTES only (the largest file is 3.7M rows and only its tail
-     matters) and asks Alpaca for 1-minute SIP bars from 04:00 ET on that date through the last completed session
+  2. Takes each file's last bar from the store's state file (store_state.py, 2026-11-12: a file's end is read in the
+     scan only when the file or its split ledger row changed since the row was written) and asks Alpaca for 1-minute SIP bars from 04:00 ET on that date through the last completed session
      (today only after 20:10 ET, else yesterday), in batches of BATCH symbols, paged with limit 10000 and
      next_page_token. Bars are formatted as each page arrives so the page's JSON can be freed.
   3. BASIS RULE - the last stored date is also the first fetched date, so the stored closes and Alpaca's are compared
@@ -29,10 +31,10 @@ Per run (hours for ~12,900 symbols x 2 stores):
 Key: config_local.py, imported with the shared helpers from alpaca_daily_refresh (the paper key works for market
 data). Never printed.
 
-usage:  python alpaca_1min_refresh.py [--dry-run] [--symbols AAPL,KR,SPY] [--all] [--store adjusted|raw|both]
+usage:  python alpaca_1min_refresh.py [--dry-run] [--symbols AAPL,KR,SPY] [--all]
         (own visible window; ends with REFRESH-1MIN-DONE)
 Scheduled since 2026-10-18 (user: "the store needs to be fixed and restarted as well"): refresh_1min_task.ps1 registers
-"1-minute store refresh" (weekdays 21:30) running refresh_1min.ps1 = this tool for both stores, then
+"1-minute store refresh" (weekdays 21:30) running refresh_1min.ps1 = this tool, then
 AmiBroker_AFL/scripts/split_adjust.py pending --store 1min for the parked basis changes.
 """
 from __future__ import annotations
@@ -52,9 +54,10 @@ from common_trading_lib import read_store_bars  # noqa: E402  (installed editabl
 from common_trading_lib import write_store_bars  # noqa: E402  (REQ-005, v0.8.0, 2026-10-22)
 from common_trading_lib import StoreLockTimeout, store_lock  # noqa: E402  (REQ-007, v0.10.0, 2026-10-22)
 from alpaca_daily_refresh import LOCK_BUSY_EXIT, LOCK_TIMEOUT_S, lock_log  # noqa: E402
+from store_state import (STATE_NAME, file_stats, folder_stats, ledger_last_splits, load_state,  # noqa: E402
+                         make_row, row_after_write, save_state, trusted)
 
-STORES = {"adjusted": (r"C:\StockData\IQbars_1min_adjusted", "split"),
-          "raw": (r"C:\StockData\IQbars_1min", "raw")}
+STORES = {"adjusted": (r"C:\StockData\IQbars_1min_adjusted", "split")}   # 2026-11-12: the raw store is gone
 PENDING = os.path.join(STORES["adjusted"][0], "_refresh_split_pending.txt")  # basis changes, for split_adjust.py
 UNMATCHED_NAME = "_refresh_unmatched_1min.txt"
 BATCH = 25                     # symbols per request; ~4,700 new bars each, so a batch is ~12 pages and ~15 MB
@@ -171,11 +174,18 @@ def refresh_store(store: str, only: list | None, dry_run: bool, include_stale: b
     store_dir, adjustment = STORES[store]
     syms = only or store_symbols(store_dir)
     log(f"[{store}] {len(syms):,} symbols in {store_dir}; adjustment={adjustment}; bars accepted through {allowed}")
-    work, unmatched, stale, current, missing = [], [], 0, 0, 0
+    # 2026-11-12 (the efficiency review's finding 5): each file's last bar is kept in the store's state file, and a
+    # file's end is read in this scan only when the folder listing shows another size or modified time than the row,
+    # or the split ledger another last split. Before, every run opened every file here (about 10 minutes a night).
+    state = load_state(store_dir)
+    last_splits = ledger_last_splits(store_dir)
+    stats = (folder_stats(store_dir, "_1.csv") if only is None
+             else {s: file_stats(os.path.join(store_dir, f"{s}_1.csv")) for s in syms})
+    work, unmatched, stale, current, missing, reads = [], [], 0, 0, 0, 0
     t_scan = time.time()
     for s in syms:
         path = os.path.join(store_dir, f"{s}_1.csv")
-        if not os.path.exists(path):
+        if stats.get(s) is None:
             a = alpaca_name(s, assets) if create_missing and only else ""
             if a:                                   # a new file: fetched from CREATE_DAYS back, every bar is new
                 first = allowed - dt.timedelta(days=CREATE_DAYS)
@@ -184,7 +194,11 @@ def refresh_store(store: str, only: list | None, dry_run: bool, include_stale: b
                 continue
             missing += 1
             continue
-        last_date, last_time, _ = tail_day_rows(path)
+        if not trusted(state.get(s), stats[s], last_splits.get(s, "")):
+            last_date, last_time, _ = tail_day_rows(path)   # the fall-back: read the file's end, as every run did before
+            reads += 1
+            state[s] = make_row(s, stats[s], last_date, last_time, last_splits.get(s, ""))
+        last_date, last_time = state[s]["last_date"], state[s]["last_time"]
         if not last_date:
             continue
         last = parse_mdy(last_date)
@@ -204,7 +218,8 @@ def refresh_store(store: str, only: list | None, dry_run: bool, include_stale: b
             fh.write("\n".join(unmatched))
     log(f"[{store}] to refresh {len(work):,}; already current {current:,}; stale (> {STALE_DAYS} days, delisted?) "
         f"{stale:,}; not on Alpaca {len(unmatched):,} -> {UNMATCHED_NAME}; no store file {missing:,} "
-        f"(scan {time.time() - t_scan:.0f}s)")
+        f"(scan {time.time() - t_scan:.0f}s: {reads:,} file ends read, {len(syms) - reads - missing:,} known from "
+        f"{STATE_NAME})")
     by_last = {}
     for item in work:
         by_last.setdefault(item[2], []).append(item)
@@ -227,11 +242,18 @@ def refresh_store(store: str, only: list | None, dry_run: bool, include_stale: b
                 if not os.path.exists(path):                # --create-missing: nothing stored to check the basis against
                     if not dry_run:
                         write_store_bars(store_dir, s, "1 min", new)
+                        state[s] = row_after_write(s, path, new, last_splits.get(s, ""))
                     log(f"  [{store}] {s}: {'would create' if dry_run else 'created'} with {len(new):,} bars")
                     appended += len(new)
                     files += 1
                     continue
-                _, _, closes = tail_day_rows(path)
+                read_date, read_time, closes = tail_day_rows(path)
+                if (read_date, read_time) != (last_date, last_time):    # 2026-11-12: this read is also the check on the state row
+                    log(f"  [{store}] {s}: the state row said the file ends {last_date} {last_time}, the file ends "
+                        f"{read_date} {read_time} - nothing appended, the row is dropped and the file read next run")
+                    state.pop(s, None)
+                    refused += 1
+                    continue
                 ratios = [closes[t] / c for d, t, c, _ in got if d == last_date and c and t in closes]
                 ratio = statistics.median(ratios) if ratios else 1.0
                 if ratios and abs(ratio - 1) > SPLIT_TOL:
@@ -252,7 +274,9 @@ def refresh_store(store: str, only: list | None, dry_run: bool, include_stale: b
                     except ValueError as e:                 # a refused batch: nothing written, logged, the run goes on
                         log(f"  [{store}] {s}: batch REFUSED by write_store_bars, nothing written - {e}")
                         refused += 1
+                        state.pop(s, None)                  # the row and the file disagree: read the file next run
                         continue
+                    state[s] = row_after_write(s, path, new, last_splits.get(s, ""))
                 appended += len(new)
                 files += 1
             done += len(batch)
@@ -261,6 +285,8 @@ def refresh_store(store: str, only: list | None, dry_run: bool, include_stale: b
                 log(f"  [{store}] {done:,}/{len(work):,} symbols  files +{files:,} bars +{appended:,}  "
                     f"pending {pending}  thin {thin}  no-new {empty:,}  {el:.0f}s  {done / el * 60:.0f} sym/min")
                 mark = done + PROGRESS_EVERY
+    if not dry_run:                                         # a full run drops the rows of files that are gone
+        save_state(store_dir, state if only else {s: row for s, row in state.items() if s in stats})
     log(f"[{store}] {'DRY RUN: would append' if dry_run else 'appended'} {appended:,} bars to {files:,} files; "
         f"split basis changes {pending} (nothing appended, see {os.path.basename(PENDING)}); thin overlap {thin}; "
         f"no new bars {empty:,}; refused {refused}; {time.time() - t0:.0f}s")
@@ -271,7 +297,8 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="fetch and report, write nothing")
     ap.add_argument("--symbols", help="comma list (smoke test)")
     ap.add_argument("--all", action="store_true", help=f"include files older than {STALE_DAYS} days (the full run)")
-    ap.add_argument("--store", choices=["adjusted", "raw", "both"], default="both")
+    ap.add_argument("--store", choices=["adjusted"], default="adjusted",
+                    help="the one store left since 2026-11-12 (kept so a caller's --store adjusted still parses)")
     ap.add_argument("--create-missing", action="store_true",
                     help=f"with --symbols: create a missing store file holding the last {CREATE_DAYS} calendar days")
     ap.add_argument("--lock-timeout", type=float, default=LOCK_TIMEOUT_S,
@@ -282,13 +309,12 @@ def main() -> int:
     assets = alpaca_assets()
     log(f"Alpaca active assets {len(assets):,}; newest session accepted {allowed} (now {now:%Y-%m-%d %H:%M} ET)")
     only = [s.strip().upper() for s in a.symbols.split(",")] if a.symbols else None
-    for store in (["adjusted", "raw"] if a.store == "both" else [a.store]):
-        try:                                        # 2026-10-22 (REQ-007): one lock per store pass
-            with store_lock(STORES[store][0], "alpaca_1min_refresh", timeout_s=a.lock_timeout, log=lock_log):
-                refresh_store(store, only, a.dry_run, a.all, assets, allowed, a.create_missing)
-        except StoreLockTimeout as e:
-            print(f"LOCK-BUSY [{store}] {e}", flush=True)
-            return LOCK_BUSY_EXIT
+    try:                                            # 2026-10-22 (REQ-007): one lock around the store pass
+        with store_lock(STORES[a.store][0], "alpaca_1min_refresh", timeout_s=a.lock_timeout, log=lock_log):
+            refresh_store(a.store, only, a.dry_run, a.all, assets, allowed, a.create_missing)
+    except StoreLockTimeout as e:
+        print(f"LOCK-BUSY [{a.store}] {e}", flush=True)
+        return LOCK_BUSY_EXIT
     print("REFRESH-1MIN-DONE", flush=True)
     return 0
 

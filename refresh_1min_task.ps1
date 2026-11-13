@@ -4,7 +4,7 @@
 # 21:30: today's 1-minute bars are complete after 20:10 ET, and the bot's nightly job (20:30, one Alpaca news request
 # per stored symbol, ~7,100) shares the 200-per-minute Alpaca budget, so this one starts after it. Run once from here:
 #
-#   .\refresh_1min_task.ps1                 # 21:30 local, Monday-Friday, both stores
+#   .\refresh_1min_task.ps1                 # 21:30 local, Monday-Friday
 #   .\refresh_1min_task.ps1 -At 22:00
 #   .\refresh_1min_task.ps1 -Unregister     # remove it
 param(

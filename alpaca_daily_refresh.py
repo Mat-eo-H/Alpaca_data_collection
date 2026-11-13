@@ -8,7 +8,9 @@ Per run (a few minutes for ~13,000 symbols):
   2. Maps DTN names to Alpaca names against Alpaca's active asset list (identical for common stock, class shares, .WS warrants
      and .U units; preferreds ABR-D -> ABR.PRD). Names Alpaca does not know go to _refresh_unmatched.txt and are left alone
      (one unknown symbol fails the whole request). Files whose last bar is older than STALE_DAYS are skipped as delisted.
-  3. Reads each file's last bar date, asks Alpaca for split-adjusted SIP daily bars from OVERLAP_DAYS before it (batches of
+  3. Takes each file's last bar date and last closes from the store's state file (store_state.py, 2026-11-12; the file's
+     end is read only when the file or its split ledger row changed since), asks Alpaca for split-adjusted SIP daily bars
+     from OVERLAP_DAYS before it (batches of
      BATCH symbols, paged) and compares the closes on the overlapping days: a constant ratio away from 1 = a split since the
      last refresh -> the whole file is rescaled to Alpaca's basis (prices divided by the ratio, volume multiplied) before the
      new bars are appended. DTN's basis and Alpaca's agreed to the cent on the overlap days checked 2026-09-10.
@@ -38,6 +40,8 @@ from config_local import API_KEY, API_SECRET  # noqa: E402
 from common_trading_lib import read_store_bars  # noqa: E402  (installed editable into C:\Python314 on 2026-10-21)
 from common_trading_lib import write_store_bars  # noqa: E402  (REQ-005, v0.8.0, 2026-10-22)
 from common_trading_lib import StoreLockTimeout, store_lock  # noqa: E402  (REQ-007, v0.10.0, 2026-10-22)
+from store_state import (STATE_NAME, file_stats, folder_stats, ledger_last_splits, load_state,  # noqa: E402
+                         make_row, row_after_write, save_state, trusted, unpack_closes)
 
 STORE = r"C:\StockData\IQbars_Daily"
 UNMATCHED = os.path.join(STORE, "_refresh_unmatched.txt")
@@ -49,6 +53,8 @@ NY = zoneinfo.ZoneInfo("America/New_York")
 SKIP_SUFFIX = (".Z", ".X", ".XO")
 BATCH = 150
 OVERLAP_DAYS = 10
+KEEP_CLOSES = OVERLAP_DAYS + 1       # the state file keeps this many last closes per symbol: every stored day the overlap
+                                     # request (OVERLAP_DAYS calendar days back) can reach, so the split check sees the same
 STALE_DAYS = 45
 SPLIT_TOL = 0.005
 CLOSE_TIME = dt.time(16, 10)
@@ -187,10 +193,11 @@ def rescale_file(path: str, ratio: float) -> int:
     return n
 
 
-def create_files(creates: list, allowed: dt.date, end: str, dry_run: bool) -> int:
+def create_files(creates: list, allowed: dt.date, end: str, dry_run: bool, state: dict, splits: dict) -> int:
     """Write a NEW store file for each (DTN symbol, Alpaca symbol) in `creates` from Alpaca's daily history since
     CREATE_START through `allowed` (2026-10-22: the refresh watcher's create-file mode for a name the store lacks, e.g. a
-    new listing). Returns the files written; a symbol Alpaca has no bars for is logged and skipped."""
+    new listing). Returns the files written; a symbol Alpaca has no bars for is logged and skipped. Each new file gets
+    its row in `state` (2026-11-12)."""
     written = 0
     for i in range(0, len(creates), BATCH):
         batch = creates[i:i + BATCH]
@@ -201,7 +208,10 @@ def create_files(creates: list, allowed: dt.date, end: str, dry_run: bool) -> in
                 log(f"  {s}: no store file and Alpaca has no daily bars - not created")
                 continue
             if not dry_run:
-                write_store_bars(STORE, s, "1 day", [fmt_row(s, b) for b in got])
+                lines = [fmt_row(s, b) for b in got]
+                write_store_bars(STORE, s, "1 day", lines)
+                state[s] = row_after_write(s, os.path.join(STORE, f"{s}_daily.csv"), lines, splits.get(s, ""),
+                                           keep=KEEP_CLOSES)
             written += 1
             log(f"  {s}: {'would create' if dry_run else 'created'} {s}_daily.csv, {len(got):,} bars "
                 f"{got[0]['t'][:10]} .. {got[-1]['t'][:10]}")
@@ -217,20 +227,33 @@ def refresh(only: list | None, dry_run: bool, include_stale: bool, through: dt.d
     assets = alpaca_assets()
     syms = only or store_symbols()
     log(f"store symbols {len(syms):,}; Alpaca active assets {len(assets):,}; bars accepted through {allowed}")
-    work, unmatched, stale, current, creates = [], [], 0, 0, []
+    # 2026-11-12 (the efficiency review's finding 5): what the last run learned about each file - its last date and the
+    # closes the split check compares - is kept in the store's state file, and a file's end is read again only when the
+    # folder listing shows another size or modified time than the row, or the split ledger another last split. Before,
+    # every run opened every file (7 to 14 minutes a night) to learn it.
+    state = load_state(STORE)
+    last_splits = ledger_last_splits(STORE)
+    stats =(folder_stats(STORE, "_daily.csv") if only is None
+             else {s: file_stats(os.path.join(STORE, f"{s}_daily.csv")) for s in syms})
+    work, unmatched, stale, current, creates, reads = [], [], 0, 0, [], 0
+    t_scan = time.time()
     for s in syms:
         path = os.path.join(STORE, f"{s}_daily.csv")
-        if not os.path.exists(path):
+        if stats.get(s) is None:
             a = alpaca_name(s, assets) if create_missing and only else ""
             if a:
                 creates.append((s, a))
             else:
                 log(f"  no store file for {s} - skipped")
             continue
-        rows = tail_rows(path)
-        if not rows:
+        if not trusted(state.get(s), stats[s], last_splits.get(s, "")):
+            rows = tail_rows(path)                  # the fall-back: read the file's end, as every run did before
+            reads += 1
+            state[s] = make_row(s, stats[s], rows[-1][1] if rows else "", rows[-1][2] if rows else "",
+                                last_splits.get(s, ""), [(r[1], float(r[6])) for r in rows[-KEEP_CLOSES:]])
+        if not state[s]["last_date"]:
             continue
-        last = parse_mdy(rows[-1][1])
+        last = parse_mdy(state[s]["last_date"])
         if last >= allowed:
             current += 1
             continue
@@ -241,19 +264,20 @@ def refresh(only: list | None, dry_run: bool, include_stale: bool, through: dt.d
         if not a:
             unmatched.append(s)
             continue
-        work.append((s, a, last, {r[1]: float(r[6]) for r in rows}))
+        work.append((s, a, last, unpack_closes(state[s]["closes"])))
     if only is None and not dry_run:                # 2026-10-22: a --symbols run (the refresh watcher) must not clobber the full list
         with open(UNMATCHED, "w", encoding="utf-8") as fh:
             fh.write("\n".join(unmatched))
     log(f"to refresh {len(work):,}; already current {current:,}; stale (> {STALE_DAYS} days, delisted?) {stale:,}; "
         f"not on Alpaca {len(unmatched):,} -> {UNMATCHED}")
+    log(f"scan {time.time() - t_scan:.0f}s: {reads:,} file ends read, {len(syms) - reads:,} known from {STATE_NAME}")
     appended = files = splits = empty = refused = 0
     t0 = time.time()
     end = request_end(allowed)
     log(f"request window ends {end}")
     if creates:
         log(f"creating {len(creates)} missing files from {CREATE_START} through {allowed}")
-        files += create_files(creates, allowed, end, dry_run)
+        files += create_files(creates, allowed, end, dry_run, state, last_splits)
     by_last = {}
     for item in work:
         by_last.setdefault(item[2], []).append(item)
@@ -287,17 +311,23 @@ def refresh(only: list | None, dry_run: bool, include_stale: bool, through: dt.d
                         record_pending(s, ratio, len(ratios), last_date, new[-1]["t"][:10])
                     continue
                 if not dry_run:
+                    lines = [fmt_row(s, b) for b in new]
                     try:                                    # 2026-10-22 (REQ-005): the library's store writer, one write + fsync
-                        write_store_bars(STORE, s, "1 day", [fmt_row(s, b) for b in new])
+                        write_store_bars(STORE, s, "1 day", lines)
                     except ValueError as e:                 # a refused batch: nothing written, logged, the run goes on
                         log(f"  {s}: batch REFUSED by write_store_bars, nothing written - {e}")
                         refused += 1
+                        state.pop(s, None)                  # the row and the file disagree: read the file next run
                         continue
+                    state[s] = row_after_write(s, os.path.join(STORE, f"{s}_daily.csv"), lines, last_splits.get(s, ""),
+                                               closes, KEEP_CLOSES)
                 appended += len(new)
                 files += 1
             done = i + len(batch)
             if done % (BATCH * 10) == 0 or done == len(items):
                 log(f"  {done:,}/{len(items):,} symbols ending {last}  files +{files:,} bars +{appended:,}  {time.time() - t0:.0f}s")
+    if not dry_run:                                 # a full run drops the rows of files that are gone; a --symbols run keeps all
+        save_state(STORE, state if only else {s: row for s, row in state.items() if s in stats})
     log(f"{'DRY RUN: would append' if dry_run else 'appended'} {appended:,} bars to {files:,} files; splits {splits}; "
         f"no new bars {empty:,}; refused {refused}; {time.time() - t0:.0f}s")
     print("REFRESH-DONE", flush=True)

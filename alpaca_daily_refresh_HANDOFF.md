@@ -4,6 +4,12 @@ Appends Alpaca's split-adjusted SIP daily bars to `C:\StockData\IQbars_Daily\<SY
 ended 2026-09-09). Docstring = mechanics; `Sync_AmiBroker/daily_refresh.ps1` runs it every weekday evening (Task Scheduler
 "Daily data refresh", registered by `daily_refresh_task.ps1`).
 
+## 2026-11-12 — the scan reads no file any more (uncommitted)
+
+The last date and the closes the split check compares come from `IQbars_Daily\_refresh_state.csv` (`store_state.py`,
+see `store_state_HANDOFF.md`); a file's end is read only when the file or its split-ledger row changed. Measured: scan
+331 s -> 0 s, same work list and the same four split detections as the 17:45 run of that night.
+
 ## Active work — 2026-09-10
 
 **Done**

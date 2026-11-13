@@ -1,18 +1,18 @@
-# refresh_1min.ps1 - top the two 1-minute stores off from Alpaca in a VISIBLE window, then resolve the basis changes the
+# refresh_1min.ps1 - top the 1-minute store off from Alpaca in a VISIBLE window, then resolve the basis changes the
 # refresh parked (2026-10-18, user: "the store needs to be fixed and restarted as well" - the stores had stopped on
 # 2026-09-25 because alpaca_1min_refresh.py was only ever run by hand; the daily chain tops off only the index files).
-#   1. alpaca_1min_refresh.py --store <Store>   Alpaca SIP 1-minute bars after each file's last minute (today's bars only
+#   1. alpaca_1min_refresh.py                   Alpaca SIP 1-minute bars after each file's last minute (today's bars only
 #                                               after 20:10 ET, so the task runs at 21:30, after the bot's nightly job)
-#   2. split_adjust.py pending --store 1min     the adjusted store's parked basis changes (the chain's forward step)
+#   2. split_adjust.py pending --store 1min     the store's parked basis changes (the chain's forward step)
+# 2026-11-12: ONE store, C:\StockData\IQbars_1min_adjusted. The raw twin C:\StockData\IQbars_1min and its nightly pass
+# (16 to 29 minutes, read by nothing) are gone, and with them the -Store parameter (user: "we only need the adjusted store").
 # Tee log C:\StockData\_refresh_1min_<stamp>.log (UTF-16), status marker C:\StockData\_refresh_1min_status.txt
 # (RUNNING <step> ... DONE | DONE-WITH-ERRORS), ends with REFRESH-1MIN-CHAIN-DONE. Registered by refresh_1min_task.ps1.
-#   .\refresh_1min.ps1                     # both stores (what the task runs)
-#   .\refresh_1min.ps1 -Store adjusted     # one store (the 2026-10-18 catch-up: the adjusted store first, then raw)
+#   .\refresh_1min.ps1                     # what the task runs
 param(
-    [ValidateSet("adjusted", "raw", "both")][string]$Store = "both",
     [string]$Stamp = (Get-Date -Format 'yyyyMMdd_HHmmss')
 )
-$host.UI.RawUI.WindowTitle = "1-MINUTE STORE REFRESH $Stamp ($Store)"
+$host.UI.RawUI.WindowTitle = "1-MINUTE STORE REFRESH $Stamp"
 $env:PYTHONUTF8 = "1"
 $env:PYTHONUNBUFFERED = "1"
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -34,10 +34,8 @@ function Step($name, $dir, $argv) {
     if ($LASTEXITCODE -ne 0) { $script:failed += $name; "!! step $name failed (exit $LASTEXITCODE)" | Tee-Object -FilePath $log -Append }
 }
 
-"=== 1-MINUTE STORE REFRESH $Stamp store=$Store" | Tee-Object -FilePath $log -Append
-Step "alpaca-1min" (Join-Path $root "Alpaca_data_collection") @("alpaca_1min_refresh.py", "--store", $Store)
-if ($Store -ne "raw") {
-    Step "split-pending-1min" (Join-Path $root "AmiBroker_AFL\scripts") @("split_adjust.py", "pending", "--store", "1min")
-}
+"=== 1-MINUTE STORE REFRESH $Stamp" | Tee-Object -FilePath $log -Append
+Step "alpaca-1min" (Join-Path $root "Alpaca_data_collection") @("alpaca_1min_refresh.py")
+Step "split-pending-1min" (Join-Path $root "AmiBroker_AFL\scripts") @("split_adjust.py", "pending", "--store", "1min")
 if ($failed.Count -eq 0) { Mark "DONE" } else { Mark "DONE-WITH-ERRORS $($failed -join ',')" }
 "REFRESH-1MIN-CHAIN-DONE $(Get-Date -Format 'HH:mm:ss') failed=$($failed.Count)" | Tee-Object -FilePath $log -Append
